@@ -1,0 +1,4 @@
+store_name,website,shopify_status,email,contact_page,about_page,instagram,facebook,tiktok,linkedin,country,status
+,https://example-store.com,UNKNOWN,,,,,,,,,blocked_or_unavailable
+,https://another-store.com,UNKNOWN,,,,,,,,,blocked_or_unavailable
+,https://third-store.com,UNKNOWN,,,,,,,,,blocked_or_unavailable
