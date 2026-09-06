@@ -158,23 +158,24 @@ if run_clicked:
     st.session_state.logs = logs
     st.session_state.last_stats = result
     saved = int(result.get("high") or 0) + int(result.get("medium") or 0)
-    if saved > 0:
+    complete = bool(result.get("complete")) and saved > 0
+    if complete:
         st.session_state.flash_kind = "success"
         st.session_state.flash = (
-            f"Cycle finished. {saved} HIGH/MEDIUM lead(s) were saved. "
+            f"Discovery found {saved} qualifying HIGH/MEDIUM store(s) this run. "
             "Open the Qualifying leads tab."
         )
-    elif result.get("candidates"):
+    elif result.get("checked"):
         st.session_state.flash_kind = "warning"
         st.session_state.flash = (
-            "Cycle finished, but no store met the MEDIUM freshness bar. "
-            "Open Rejected candidates and the Activity log to see what was found."
+            f"Discovery did not complete. No store met the {min_freshness} freshness bar "
+            "this run. Open Rejected candidates and the Activity log."
         )
     else:
         st.session_state.flash_kind = "warning"
         st.session_state.flash = (
-            "Cycle finished, but the public sources returned no usable candidates. "
-            "Open the Activity log to see which sources were skipped."
+            "Discovery did not complete. Public sources did not give any unused "
+            "website to check this run. Open the Activity log."
         )
     st.rerun()
 
@@ -202,7 +203,8 @@ with leads_tab:
     if leads_df.empty:
         st.info(
             "No HIGH/MEDIUM leads are saved yet. "
-            "If a cycle just ran, check the activity log above and the Rejected candidates tab."
+            "A run is complete only after a qualifying store is found. "
+            "Check the activity log and the Rejected candidates tab."
         )
     else:
         email_only = st.checkbox("Show only rows with a public email", value=False)

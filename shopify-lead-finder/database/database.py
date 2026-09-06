@@ -178,6 +178,36 @@ def already_processed(connection: sqlite3.Connection, domain: str, recheck_after
         return True
 
 
+def recently_processed_domains(
+    connection: sqlite3.Connection,
+    recheck_after_days: int,
+) -> set[str]:
+    """Domains the pipeline should skip until the recheck window expires."""
+    from datetime import datetime, timezone
+
+    rows = connection.execute(
+        "SELECT domain, last_checked FROM processed_domains"
+    ).fetchall()
+    skipped: set[str] = set()
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        domain = str(row["domain"] or "").strip()
+        if not domain:
+            continue
+        if recheck_after_days <= 0:
+            skipped.add(domain)
+            continue
+        try:
+            checked = datetime.fromisoformat(row["last_checked"])
+            if checked.tzinfo is None:
+                checked = checked.replace(tzinfo=timezone.utc)
+            if (now - checked).days < recheck_after_days:
+                skipped.add(domain)
+        except Exception:
+            skipped.add(domain)
+    return skipped
+
+
 def is_new_domain(connection: sqlite3.Connection, domain: str) -> bool:
     row = connection.execute(
         "SELECT domain FROM processed_domains WHERE domain = ?",

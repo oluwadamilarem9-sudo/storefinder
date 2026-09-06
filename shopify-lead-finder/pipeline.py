@@ -17,6 +17,7 @@ from database.database import (
     export_rejected_csv,
     latest_leads,
     mark_processed,
+    recently_processed_domains,
     upsert_lead,
     upsert_rejected,
 )
@@ -67,6 +68,8 @@ def run_cycle(
         "low": 0,
         "emails": 0,
         "duplicates": 0,
+        "checked": 0,
+        "complete": False,
     }
 
     connection = connect()
@@ -74,29 +77,60 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v4")
-        log("Discovery cycle started...")
+        log("Discovery engine v5")
+        log("Discovery started. A run is complete only after a qualifying store is saved.")
 
-        raw_candidates = discover_candidates(
-            limit_per_source=config.MAX_DOMAINS_PER_CYCLE,
-            on_log=log,
+        seen_this_run: set[str] = set(
+            recently_processed_domains(connection, config.RECHECK_AFTER_DAYS)
         )
-        stats["candidates"] = len(raw_candidates)
-        if not raw_candidates:
-            log("No candidates came back from any public source this cycle.")
-        ready, duplicates, junk = prepare_candidates(raw_candidates, connection)
-        stats["duplicates"] = duplicates + junk
-        to_check = ready[: config.MAX_DOMAINS_PER_CYCLE]
+        max_domains = config.MAX_DOMAINS_PER_CYCLE
+        max_passes = 3
 
-        log(f"Unique websites to check this cycle: {len(to_check)}")
+        for attempt in range(1, max_passes + 1):
+            if _qualifying_count(stats) > 0 or stats["checked"] >= max_domains:
+                break
+            if attempt > 1:
+                log(
+                    f"No qualifying store yet. Continuing discovery "
+                    f"(pass {attempt}/{max_passes})..."
+                )
 
-        for index, candidate in enumerate(to_check, start=1):
-            try:
-                _process_candidate(connection, candidate, index, len(to_check), stats, log)
-            except Exception as exc:
-                log(f"  Error on {candidate.domain}: {exc}")
-                mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
+            raw_candidates = discover_candidates(
+                limit_per_source=max_domains,
+                on_log=log,
+                exclude_domains=seen_this_run,
+                min_unused=max(1, max_domains - stats["checked"]),
+            )
+            stats["candidates"] += len(raw_candidates)
+            if not raw_candidates:
+                log("No candidates came back from any public source this pass.")
 
+            ready, duplicates, junk = prepare_candidates(raw_candidates, connection)
+            stats["duplicates"] += duplicates + junk
+            to_check = [
+                item
+                for item in ready
+                if item.domain not in seen_this_run
+            ][: max_domains - stats["checked"]]
+
+            log(f"Unused websites to check this pass: {len(to_check)}")
+            if not to_check:
+                log("No unused websites remain from public sources.")
+                break
+
+            for candidate in to_check:
+                seen_this_run.add(candidate.domain)
+                stats["checked"] += 1
+                index = stats["checked"]
+                try:
+                    _process_candidate(connection, candidate, index, max_domains, stats, log)
+                except Exception as exc:
+                    log(f"  Error on {candidate.domain}: {exc}")
+                    mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
+                if _qualifying_count(stats) > 0 and stats["checked"] >= max_domains:
+                    break
+
+        stats["complete"] = _qualifying_count(stats) > 0
         export_csv(connection)
         export_rejected_csv(connection)
         _log_summary(connection, stats, log)
@@ -209,9 +243,15 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
 
 
+def _qualifying_count(stats: dict) -> int:
+    return int(stats.get("high") or 0) + int(stats.get("medium") or 0)
+
+
 def _log_summary(connection, stats: dict, log: LogFn) -> None:
+    saved = _qualifying_count(stats)
     log("========================================")
     log(f"Candidates discovered: {stats['candidates']}")
+    log(f"Websites checked this run: {stats['checked']}")
     log(f"Shopify stores: {stats['shopify']}")
     log(f"High freshness: {stats['high']}")
     log(f"Medium freshness: {stats['medium']}")
@@ -219,11 +259,14 @@ def _log_summary(connection, stats: dict, log: LogFn) -> None:
     log(f"Public business emails: {stats['emails']}")
     log(f"Duplicates: {stats['duplicates']}")
 
-    leads = latest_leads(connection, limit=5)
-    if not leads:
-        log("No HIGH/MEDIUM freshness leads saved yet.")
+    if saved > 0:
+        log(f"Discovery found {saved} qualifying HIGH/MEDIUM store(s) this run.")
     else:
-        log("Latest qualifying leads:")
+        log("Discovery did not complete: no HIGH/MEDIUM store was saved this run.")
+
+    leads = latest_leads(connection, limit=5)
+    if leads:
+        log("Latest qualifying leads on file (may include earlier runs):")
         for index, lead in enumerate(leads, start=1):
             name = lead.get("store_name") or lead.get("domain")
             email = lead.get("public_email") or "no public email"

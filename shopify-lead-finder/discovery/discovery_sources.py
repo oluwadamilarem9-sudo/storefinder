@@ -220,16 +220,25 @@ class UrlscanRecentSource(PublicDiscoverySource):
         last_error = ""
 
         for query in self.queries:
-            if len(found) >= limit:
-                break
-            url = (
-                "https://urlscan.io/api/v1/search/"
-                f"?q={quote(query)}&size={min(max(limit, 10), 100)}"
-            )
-            payload, last_error = self._search(url)
-            if payload is None:
-                continue
-            self._collect(payload, url, found, seen, limit)
+            search_after = None
+            for _page in range(3):
+                if len(found) >= limit:
+                    break
+                url = (
+                    "https://urlscan.io/api/v1/search/"
+                    f"?q={quote(query)}&size=100"
+                )
+                if search_after:
+                    url += f"&search_after={quote(','.join(str(part) for part in search_after))}"
+                payload, last_error = self._search(url)
+                if payload is None:
+                    break
+                results = payload.get("results") or []
+                self._collect(payload, url, found, seen, limit)
+                sort_key = results[-1].get("sort") if results else None
+                if not results or not isinstance(sort_key, list) or len(found) >= limit:
+                    break
+                search_after = sort_key
 
         if not found and last_error:
             print(f"  Skipping {self.name} ({last_error}).")

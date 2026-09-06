@@ -1,0 +1,17 @@
+---
+description: A discovery cycle is complete only when a qualifying store is found
+alwaysApply: true
+---
+
+# Discovery cycle completion
+
+A cycle is complete only when this run saved at least one new HIGH/MEDIUM qualifying store.
+
+- Never show "finished", "cycle finished", or equivalent success-complete copy unless that happened.
+- If sources were empty, blocked, all duplicates, robots-denied, or below the freshness bar, the cycle did not complete. Say that. Point to the activity log and Rejected candidates.
+- Keep searching public sources and unused candidates in the same run until a qualifying store is saved, `max_domains` websites were actually checked, or every available source is exhausted.
+- Do not treat leftover leads from an earlier run as proof this cycle succeeded.
+- Do not ask the user to paste store URLs.
+- Do not invent launch dates. "Found today" is not "launched today."
+- Qualifying leads are HIGH/MEDIUM only. LOW/UNKNOWN go to rejected.
+- Public data only. Respect robots.txt on storefronts. No admin, CAPTCHA, or auth bypass.

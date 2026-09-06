@@ -72,6 +72,19 @@ streamlit run app.py
 
 Your browser should open to `http://localhost:8501`. Click **Run discovery cycle**. You do not paste store URLs.
 
+**Do not deploy this app to Vercel.** Vercel hosts static sites and short serverless functions. This is a Streamlit Python app, so Vercel shows `404: NOT_FOUND`.
+
+Use [Streamlit Community Cloud](https://share.streamlit.io/) instead:
+
+1. Sign in with GitHub.
+2. Click **New app**.
+3. Repository: `oluwadamilarem9-sudo/storefinder`
+4. Branch: `main`
+5. Main file path: `shopify-lead-finder/app.py`
+6. Click **Deploy**.
+
+Render.com also works if you connect the same GitHub repo. The repo includes `render.yaml` for that.
+
 **Terminal (optional):**
 
 ```powershell
