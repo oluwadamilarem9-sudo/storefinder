@@ -15,9 +15,8 @@ from database.database import (
     connect,
     export_csv,
     export_rejected_csv,
-    latest_leads,
+    known_domains,
     mark_processed,
-    recently_processed_domains,
     upsert_lead,
     upsert_rejected,
 )
@@ -70,6 +69,9 @@ def run_cycle(
         "duplicates": 0,
         "checked": 0,
         "complete": False,
+        "skipped_seen": 0,
+        "this_run_lead_domains": [],
+        "this_run_rejected_domains": [],
     }
 
     connection = connect()
@@ -77,12 +79,16 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v5")
+        log("Discovery engine v6")
         log("Discovery started. A run is complete only after a qualifying store is saved.")
+        log("Stores from earlier runs are excluded and will not be checked again.")
 
-        seen_this_run: set[str] = set(
-            recently_processed_domains(connection, config.RECHECK_AFTER_DAYS)
-        )
+        seen_this_run: set[str] = set(known_domains(connection))
+        stats["skipped_seen"] = len(seen_this_run)
+        if seen_this_run:
+            log(
+                f"Skipping {len(seen_this_run)} store(s) already used in earlier runs."
+            )
         max_domains = config.MAX_DOMAINS_PER_CYCLE
         max_passes = 3
 
@@ -173,6 +179,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
                 "reject_reason": "filtered_demo_or_test_store",
             },
         )
+        stats["this_run_rejected_domains"].append(final_domain or domain)
         return
 
     shopify_status = detect_shopify(homepage.text, homepage.headers)
@@ -233,10 +240,12 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         else:
             log("  Email: none publicly displayed")
         upsert_lead(connection, record)
+        stats["this_run_lead_domains"].append(final_domain)
         log("  Status: saved to leads.csv")
     else:
         record["reject_reason"] = "below_freshness_threshold"
         upsert_rejected(connection, record)
+        stats["this_run_rejected_domains"].append(final_domain)
         log("  Status: rejected (freshness below threshold)")
 
     if final_domain != domain:
@@ -257,20 +266,16 @@ def _log_summary(connection, stats: dict, log: LogFn) -> None:
     log(f"Medium freshness: {stats['medium']}")
     log(f"Low freshness: {stats['low']}")
     log(f"Public business emails: {stats['emails']}")
-    log(f"Duplicates: {stats['duplicates']}")
+    log(f"Duplicates / already seen: {stats['duplicates']}")
+    log(f"Excluded from earlier runs: {stats['skipped_seen']}")
 
     if saved > 0:
         log(f"Discovery found {saved} qualifying HIGH/MEDIUM store(s) this run.")
+        this_run = stats.get("this_run_lead_domains") or []
+        for index, domain in enumerate(this_run, start=1):
+            log(f"{index}. https://{domain}")
     else:
         log("Discovery did not complete: no HIGH/MEDIUM store was saved this run.")
-
-    leads = latest_leads(connection, limit=5)
-    if leads:
-        log("Latest qualifying leads on file (may include earlier runs):")
-        for index, lead in enumerate(leads, start=1):
-            name = lead.get("store_name") or lead.get("domain")
-            email = lead.get("public_email") or "no public email"
-            log(f"{index}. {name} | https://{lead.get('domain', '')} | {email}")
 
     log(f"Qualifying leads: {config.OUTPUT_FILE}")
     log(f"Rejected candidates: {config.REJECTED_FILE}")

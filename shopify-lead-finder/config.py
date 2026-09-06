@@ -35,7 +35,8 @@ MIN_FRESHNESS_LEVEL = "MEDIUM"
 # Extra local settings used by the discovery engine.
 MAX_CANDIDATES_PER_SOURCE = 25
 MAX_RETRIES = 0
-RECHECK_AFTER_DAYS = 14
+# 0 = never re-check. A website from an earlier cycle is never used again.
+RECHECK_AFTER_DAYS = 0
 MAX_SOURCE_BYTES = 1_000_000
 SOURCE_TIMEOUT = 10
 FAST_MODE = True

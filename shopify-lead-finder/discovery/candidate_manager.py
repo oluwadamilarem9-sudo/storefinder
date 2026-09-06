@@ -21,7 +21,7 @@ def prepare_candidates(
     connection,
 ) -> tuple[list[DiscoveredCandidate], int, int]:
     """
-    Deduplicate and drop domains that were checked recently or look like junk.
+    Deduplicate and drop domains already used in an earlier cycle, or junk.
 
     Returns (ready_candidates, duplicates_skipped, junk_skipped).
     """

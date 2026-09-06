@@ -155,57 +155,42 @@ def _rehome_unscored_leads(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
-def already_processed(connection: sqlite3.Connection, domain: str, recheck_after_days: int) -> bool:
-    """True when this domain was checked recently enough to skip."""
-    row = connection.execute(
-        "SELECT last_checked FROM processed_domains WHERE domain = ?",
-        (domain,),
-    ).fetchone()
-    if row is None:
-        return False
-    if recheck_after_days <= 0:
-        return True
-    last_checked = row["last_checked"]
-    try:
-        from datetime import datetime, timezone
+def known_domains(connection: sqlite3.Connection) -> set[str]:
+    """Every domain already used in any earlier discovery cycle."""
+    seen: set[str] = set()
+    for table in ("processed_domains", "leads", "rejected_candidates"):
+        rows = connection.execute(f"SELECT domain FROM {table}").fetchall()
+        for row in rows:
+            domain = str(row["domain"] or "").strip()
+            if domain:
+                seen.add(domain)
+    return seen
 
-        checked = datetime.fromisoformat(last_checked)
-        if checked.tzinfo is None:
-            checked = checked.replace(tzinfo=timezone.utc)
-        age_days = (datetime.now(timezone.utc) - checked).days
-        return age_days < recheck_after_days
-    except Exception:
-        return True
+
+def already_processed(
+    connection: sqlite3.Connection,
+    domain: str,
+    recheck_after_days: int = 0,
+) -> bool:
+    """True when this domain was already part of a discovery cycle."""
+    if not domain:
+        return False
+    for table in ("processed_domains", "leads", "rejected_candidates"):
+        row = connection.execute(
+            f"SELECT 1 FROM {table} WHERE domain = ?",
+            (domain,),
+        ).fetchone()
+        if row is not None:
+            return True
+    return False
 
 
 def recently_processed_domains(
     connection: sqlite3.Connection,
-    recheck_after_days: int,
+    recheck_after_days: int = 0,
 ) -> set[str]:
-    """Domains the pipeline should skip until the recheck window expires."""
-    from datetime import datetime, timezone
-
-    rows = connection.execute(
-        "SELECT domain, last_checked FROM processed_domains"
-    ).fetchall()
-    skipped: set[str] = set()
-    now = datetime.now(timezone.utc)
-    for row in rows:
-        domain = str(row["domain"] or "").strip()
-        if not domain:
-            continue
-        if recheck_after_days <= 0:
-            skipped.add(domain)
-            continue
-        try:
-            checked = datetime.fromisoformat(row["last_checked"])
-            if checked.tzinfo is None:
-                checked = checked.replace(tzinfo=timezone.utc)
-            if (now - checked).days < recheck_after_days:
-                skipped.add(domain)
-        except Exception:
-            skipped.add(domain)
-    return skipped
+    """Domains that must not enter a later discovery cycle."""
+    return known_domains(connection)
 
 
 def is_new_domain(connection: sqlite3.Connection, domain: str) -> bool:
@@ -356,10 +341,10 @@ def upsert_rejected(connection: sqlite3.Connection, row: dict) -> None:
 
 def delete_leads(connection: sqlite3.Connection, domains: list[str] | None = None) -> int:
     """
-    Delete qualifying leads.
+    Delete qualifying leads from the visible table and CSV.
 
     If domains is None, delete all lead rows.
-    Also forget them in processed_domains so they can be discovered again.
+    processed_domains is kept so the same store cannot enter a later cycle.
     """
     if domains is None:
         rows = connection.execute("SELECT domain FROM leads").fetchall()
@@ -375,10 +360,6 @@ def delete_leads(connection: sqlite3.Connection, domains: list[str] | None = Non
         f"DELETE FROM leads WHERE domain IN ({placeholders})",
         targets,
     )
-    connection.execute(
-        f"DELETE FROM processed_domains WHERE domain IN ({placeholders})",
-        targets,
-    )
     connection.commit()
     export_csv(connection)
     return len(targets)
@@ -386,10 +367,10 @@ def delete_leads(connection: sqlite3.Connection, domains: list[str] | None = Non
 
 def delete_rejected(connection: sqlite3.Connection, domains: list[str] | None = None) -> int:
     """
-    Delete rejected candidates.
+    Delete rejected candidates from the visible table and CSV.
 
     If domains is None, delete all rejected rows.
-    Also forget them in processed_domains so they can be discovered again.
+    processed_domains is kept so the same store cannot enter a later cycle.
     """
     if domains is None:
         rows = connection.execute("SELECT domain FROM rejected_candidates").fetchall()
@@ -403,10 +384,6 @@ def delete_rejected(connection: sqlite3.Connection, domains: list[str] | None = 
     placeholders = ",".join("?" * len(targets))
     connection.execute(
         f"DELETE FROM rejected_candidates WHERE domain IN ({placeholders})",
-        targets,
-    )
-    connection.execute(
-        f"DELETE FROM processed_domains WHERE domain IN ({placeholders})",
         targets,
     )
     connection.commit()

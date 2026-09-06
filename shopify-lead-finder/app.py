@@ -86,6 +86,10 @@ if "flash" not in st.session_state:
     st.session_state.flash = ""
 if "flash_kind" not in st.session_state:
     st.session_state.flash_kind = "info"
+if "this_run_lead_domains" not in st.session_state:
+    st.session_state.this_run_lead_domains = []
+if "this_run_rejected_domains" not in st.session_state:
+    st.session_state.this_run_rejected_domains = []
 
 
 st.title("Shopify Public Lead Finder")
@@ -136,8 +140,9 @@ metric_one.metric("Last cycle candidates", int(stats.get("candidates") or 0))
 metric_two.metric("Last cycle Shopify", int(stats.get("shopify") or 0))
 metric_three.metric("High freshness", int(stats.get("high") or 0))
 metric_four.metric("Medium freshness", int(stats.get("medium") or 0))
-metric_five.metric("Saved qualifying leads", qualifying_count)
-metric_six.metric("Rejected / filtered", rejected_count)
+this_run_saved = len(st.session_state.this_run_lead_domains)
+metric_five.metric("This run qualifying", this_run_saved)
+metric_six.metric("This run rejected", len(st.session_state.this_run_rejected_domains))
 
 if run_clicked:
     log_box = st.empty()
@@ -157,6 +162,8 @@ if run_clicked:
         )
     st.session_state.logs = logs
     st.session_state.last_stats = result
+    st.session_state.this_run_lead_domains = list(result.get("this_run_lead_domains") or [])
+    st.session_state.this_run_rejected_domains = list(result.get("this_run_rejected_domains") or [])
     saved = int(result.get("high") or 0) + int(result.get("medium") or 0)
     complete = bool(result.get("complete")) and saved > 0
     if complete:
@@ -191,24 +198,44 @@ with st.expander("Last cycle activity log", expanded=True):
     st.code("\n".join(st.session_state.logs), language="text")
 
 leads_tab, rejected_tab = st.tabs(
-    [f"Qualifying leads ({qualifying_count})", f"Rejected candidates ({rejected_count})"]
+    [
+        f"This run leads ({this_run_saved})",
+        f"This run rejected ({len(st.session_state.this_run_rejected_domains)})",
+    ]
 )
 
 with leads_tab:
-    st.subheader("Qualifying leads")
+    st.subheader("Qualifying leads from this run")
     st.write(
-        "Only stores that meet the freshness threshold are shown here. "
+        "Only stores found in the latest run are shown here. "
+        "Earlier runs stay in the database but are never checked again. "
         "Emails are copied from public pages only."
     )
-    if leads_df.empty:
-        st.info(
-            "No HIGH/MEDIUM leads are saved yet. "
-            "A run is complete only after a qualifying store is found. "
-            "Check the activity log and the Rejected candidates tab."
-        )
+    show_earlier_leads = st.checkbox(
+        "Also show saved leads from earlier runs",
+        value=False,
+        key="show_earlier_leads",
+    )
+    view = leads_df
+    if not show_earlier_leads:
+        this_run = set(st.session_state.this_run_lead_domains)
+        if leads_df.empty or "domain" not in leads_df.columns:
+            view = leads_df.iloc[0:0]
+        else:
+            view = leads_df[leads_df["domain"].astype(str).isin(this_run)]
+    if view.empty:
+        if show_earlier_leads:
+            st.info(
+                "No HIGH/MEDIUM leads are saved yet. "
+                "A run is complete only after a qualifying store is found."
+            )
+        else:
+            st.info(
+                "This run has no new qualifying leads. "
+                "Earlier stores are hidden so they are not mixed into this cycle."
+            )
     else:
         email_only = st.checkbox("Show only rows with a public email", value=False)
-        view = leads_df
         if email_only:
             view = view[view["public_email"].fillna("") != ""]
         st.dataframe(view, width="stretch", hide_index=True)
@@ -264,17 +291,32 @@ with leads_tab:
         st.caption(f"Also saved on disk at `{OUTPUT_FILE}`")
 
 with rejected_tab:
-    st.subheader("Rejected candidates")
+    st.subheader("Rejected candidates from this run")
     st.write(
-        "These were discovered but filtered as demo/test shops, "
-        "or they did not meet the freshness threshold. "
+        "Only websites from the latest run are shown here. "
+        "Earlier rejected stores stay excluded from future cycles. "
         "Discovery date is not a launch date."
     )
-    if rejected_df.empty:
-        st.info("No rejected candidates yet.")
+    show_earlier_rejected = st.checkbox(
+        "Also show rejected rows from earlier runs",
+        value=False,
+        key="show_earlier_rejected",
+    )
+    rejected_view = rejected_df
+    if not show_earlier_rejected:
+        this_run_rejected = set(st.session_state.this_run_rejected_domains)
+        if rejected_df.empty or "domain" not in rejected_df.columns:
+            rejected_view = rejected_df.iloc[0:0]
+        else:
+            rejected_view = rejected_df[rejected_df["domain"].astype(str).isin(this_run_rejected)]
+    if rejected_view.empty:
+        if show_earlier_rejected:
+            st.info("No rejected candidates yet.")
+        else:
+            st.info("This run has no new rejected candidates. Earlier rows are hidden.")
     else:
-        st.dataframe(rejected_df, width="stretch", hide_index=True)
-        domains = rejected_df["domain"].dropna().astype(str).tolist()
+        st.dataframe(rejected_view, width="stretch", hide_index=True)
+        domains = rejected_view["domain"].dropna().astype(str).tolist()
         selected = st.multiselect(
             "Select rejected domains to delete",
             options=domains,
