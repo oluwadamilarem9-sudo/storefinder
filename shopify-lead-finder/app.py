@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from config import (
@@ -83,6 +84,42 @@ def _csv_bytes(path: Path, fallback: pd.DataFrame) -> bytes:
     return fallback.to_csv(index=False).encode("utf-8")
 
 
+BACKEND_URL = "http://127.0.0.1:8000"
+
+
+def _backend_request(path: str, *, method: str = "GET", payload: dict | None = None, token: str | None = None):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        response = requests.request(
+            method.upper(),
+            f"{BACKEND_URL}{path}",
+            json=payload,
+            headers=headers,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Backend unavailable: {exc}") from exc
+
+    if response.status_code >= 400:
+        detail = response.text
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            pass
+        raise RuntimeError(f"Backend error {response.status_code}: {detail}")
+
+    if not response.content:
+        return {}
+    try:
+        return response.json()
+    except ValueError:
+        return {"raw": response.text}
+
+
 if "logs" not in st.session_state:
     st.session_state.logs = [
         "Ready. Click Run discovery cycle to search public sources automatically."
@@ -97,6 +134,59 @@ if "this_run_lead_domains" not in st.session_state:
     st.session_state.this_run_lead_domains = []
 if "this_run_rejected_domains" not in st.session_state:
     st.session_state.this_run_rejected_domains = []
+if "auth_token" not in st.session_state:
+    st.session_state.auth_token = None
+if "backend_user" not in st.session_state:
+    st.session_state.backend_user = None
+if "selected_project_id" not in st.session_state:
+    st.session_state.selected_project_id = None
+if "backend_projects" not in st.session_state:
+    st.session_state.backend_projects = []
+if "backend_run_id" not in st.session_state:
+    st.session_state.backend_run_id = None
+
+
+def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, token: str):
+    current_leads = _load_tables()[0]
+    lead_domains = set((result.get("this_run_lead_domains") or []))
+    if lead_domains:
+        lead_rows = current_leads[current_leads["domain"].astype(str).isin(lead_domains)]
+        for _, row in lead_rows.iterrows():
+            payload = {
+                "domain": str(row.get("domain") or ""),
+                "store_name": row.get("store_name"),
+                "public_email": row.get("public_email"),
+                "country": row.get("country"),
+                "freshness_level": row.get("freshness_level"),
+                "freshness_score": int(row.get("freshness_score") or 0),
+                "source": row.get("discovery_source"),
+                "run_id": run_id,
+            }
+            _backend_request(
+                f"/projects/{project_id}/leads",
+                method="POST",
+                payload=payload,
+                token=token,
+            )
+
+    rejected_domains = set((result.get("this_run_rejected_domains") or []))
+    if rejected_domains:
+        _, rejected_df = _load_tables()
+        rejected_rows = rejected_df[rejected_df["domain"].astype(str).isin(rejected_domains)]
+        for _, row in rejected_rows.iterrows():
+            payload = {
+                "domain": str(row.get("domain") or ""),
+                "store_name": row.get("store_name"),
+                "public_email": row.get("public_email"),
+                "reason": row.get("reject_reason") or "rejected_by_filters",
+                "run_id": run_id,
+            }
+            _backend_request(
+                f"/projects/{project_id}/rejected",
+                method="POST",
+                payload=payload,
+                token=token,
+            )
 
 
 st.title("Shopify Public Lead Finder")
@@ -107,6 +197,97 @@ st.caption(
 )
 
 with st.sidebar:
+    st.header("Account")
+    if not st.session_state.auth_token:
+        with st.form("auth_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            login_col, signup_col = st.columns(2)
+            login_clicked = login_col.form_submit_button("Login")
+            signup_clicked = signup_col.form_submit_button("Sign up")
+
+            if login_clicked and email and password:
+                try:
+                    user = _backend_request(
+                        "/auth/login",
+                        method="POST",
+                        payload={"email": email, "password": password},
+                    )
+                    st.session_state.auth_token = user["token"]
+                    st.session_state.backend_user = user["user"]
+                    st.session_state.backend_projects = []
+                    st.session_state.selected_project_id = None
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
+            if signup_clicked and email and password:
+                try:
+                    user = _backend_request(
+                        "/auth/signup",
+                        method="POST",
+                        payload={"name": email.split("@")[0], "email": email, "password": password},
+                    )
+                    st.session_state.auth_token = user["token"]
+                    st.session_state.backend_user = user["user"]
+                    st.session_state.backend_projects = []
+                    st.session_state.selected_project_id = None
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+    else:
+        user = st.session_state.backend_user or {}
+        st.write(f"Signed in as: {user.get('name', 'User')}")
+        st.write(user.get('email', ''))
+        if st.button("Logout"):
+            st.session_state.auth_token = None
+            st.session_state.backend_user = None
+            st.session_state.selected_project_id = None
+            st.session_state.backend_projects = []
+            st.rerun()
+
+        with st.form("project_form"):
+            project_name = st.text_input("New project name")
+            if st.form_submit_button("Create project") and project_name:
+                try:
+                    project = _backend_request(
+                        "/projects",
+                        method="POST",
+                        payload={"name": project_name},
+                        token=st.session_state.auth_token,
+                    )
+                    st.session_state.selected_project_id = project["id"]
+                    st.session_state.backend_projects = []
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
+        try:
+            if not st.session_state.backend_projects:
+                st.session_state.backend_projects = _backend_request(
+                    "/projects",
+                    token=st.session_state.auth_token,
+                )
+        except RuntimeError as exc:
+            st.warning(str(exc))
+
+        if st.session_state.backend_projects:
+            project_ids = [project["id"] for project in st.session_state.backend_projects]
+            project_names = [project["name"] for project in st.session_state.backend_projects]
+            selected_name = st.selectbox(
+                "Project",
+                options=project_names,
+                index=min(
+                    project_ids.index(st.session_state.selected_project_id) if st.session_state.selected_project_id in project_ids else 0,
+                    len(project_names) - 1,
+                ),
+            )
+            st.session_state.selected_project_id = st.session_state.backend_projects[project_names.index(selected_name)]["id"]
+            st.caption(f"Project ID: {st.session_state.selected_project_id}")
+        else:
+            st.info("Create a project to begin a user-scoped run.")
+
+    st.divider()
     st.header("Run settings")
     st.write("These change only this run. Defaults still live in `config.py`.")
     max_domains = st.number_input(
@@ -176,12 +357,35 @@ metric_five.metric("This run qualifying", this_run_saved)
 metric_six.metric("This run rejected", len(st.session_state.this_run_rejected_domains))
 
 if run_clicked:
+    if not st.session_state.auth_token or not st.session_state.selected_project_id:
+        st.warning("Please sign in and create/select a project before running discovery.")
+        st.stop()
+
     log_box = st.empty()
     logs: list[str] = []
 
     def on_log(message: str) -> None:
         logs.append(message)
         log_box.code("\n".join(logs[-40:]), language="text")
+
+    project_id = st.session_state.get("selected_project_id")
+    backend_run = None
+    if project_id and st.session_state.auth_token:
+        try:
+            backend_run = _backend_request(
+                f"/projects/{project_id}/runs",
+                method="POST",
+                payload={"name": f"Discovery run {len(st.session_state.logs) + 1}", "max_domains": int(max_domains)},
+                token=st.session_state.auth_token,
+            )
+            st.session_state.backend_run_id = backend_run.get("id")
+        except RuntimeError as exc:
+            st.warning(f"Project run could not be created in the backend: {exc}")
+            st.session_state.backend_run_id = None
+            st.stop()
+    else:
+        st.session_state.backend_run_id = None
+        st.stop()
 
     with st.spinner("Searching public sources and checking websites..."):
         run_cycle = _load_run_cycle()
@@ -197,6 +401,18 @@ if run_clicked:
     st.session_state.last_stats = result
     st.session_state.this_run_lead_domains = list(result.get("this_run_lead_domains") or [])
     st.session_state.this_run_rejected_domains = list(result.get("this_run_rejected_domains") or [])
+
+    if st.session_state.auth_token and project_id and st.session_state.backend_run_id:
+        try:
+            _sync_run_results_to_backend(
+                project_id,
+                st.session_state.backend_run_id,
+                result,
+                token=st.session_state.auth_token,
+            )
+        except RuntimeError as exc:
+            st.warning(f"Project sync warning: {exc}")
+
     saved = int(result.get("high") or 0) + int(result.get("medium") or 0)
     complete = bool(result.get("complete")) and saved > 0
     if complete:
