@@ -15,4 +15,5 @@ A cycle is complete only when this run saved at least one new HIGH/MEDIUM qualif
 - Do not ask the user to paste store URLs.
 - Do not invent launch dates. "Found today" is not "launched today."
 - Qualifying leads are HIGH/MEDIUM only. LOW/UNKNOWN go to rejected.
+- Country filters use only a country the storefront publishes. Never infer country from Shopify CDN IPs, urlscan scanner location, or a myshopify.com hostname.
 - Public data only. Respect robots.txt on storefronts. No admin, CAPTCHA, or auth bypass.

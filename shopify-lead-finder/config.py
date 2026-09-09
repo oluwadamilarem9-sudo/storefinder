@@ -52,6 +52,10 @@ RDAP_MEDIUM_DAYS = 180
 # Leave this False so they cannot flood the lead list.
 ENABLE_SECONDARY_SOURCES = False
 
+# Empty list means every country. Country is taken from public store pages only.
+TARGET_COUNTRIES: list[str] = []
+KEEP_UNKNOWN_COUNTRY = True
+
 USER_AGENT = (
     "ShopifyLeadFinder/1.0 "
     "(local public-research tool; respects robots.txt; no login)"

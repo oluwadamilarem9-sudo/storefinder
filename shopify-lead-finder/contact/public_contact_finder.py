@@ -7,6 +7,7 @@ It never guesses email addresses and never opens private profiles.
 
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import urlparse
 
@@ -159,7 +160,10 @@ def extract_social_links(soup: BeautifulSoup, base_url: str) -> dict[str, str]:
 
 
 def extract_country(soup: BeautifulSoup) -> str:
-    """Keep a country only when the page clearly publishes one."""
+    """Keep a country only when the page clearly publishes one.
+
+    Hosting IP, Shopify CDN region, and myshopify.com slugs are ignored.
+    """
     country_tag = soup.find(attrs={"itemprop": "addressCountry"})
     if country_tag:
         text = country_tag.get("content") or country_tag.get_text(strip=True)
@@ -168,12 +172,54 @@ def extract_country(soup: BeautifulSoup) -> str:
 
     for attrs in (
         {"property": "business:contact_data:country_name"},
-        {"name": "geo.region"},
         {"name": "og:country-name"},
     ):
         meta = soup.find("meta", attrs=attrs)
         if meta and meta.get("content"):
             return meta["content"].strip()
+
+    json_ld = _country_from_json_ld(soup)
+    if json_ld:
+        return json_ld
+    return ""
+
+
+def _country_from_json_ld(soup: BeautifulSoup) -> str:
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = tag.string or tag.get_text() or ""
+        if not raw.strip():
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        found = _walk_address_country(payload)
+        if found:
+            return found
+    return ""
+
+
+def _walk_address_country(node) -> str:
+    if isinstance(node, dict):
+        address = node.get("address") or node.get("location")
+        if isinstance(address, dict):
+            value = address.get("addressCountry")
+            if isinstance(value, dict):
+                value = value.get("name") or value.get("addressCountry")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        direct = node.get("addressCountry")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        for value in node.values():
+            found = _walk_address_country(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _walk_address_country(item)
+            if found:
+                return found
     return ""
 
 

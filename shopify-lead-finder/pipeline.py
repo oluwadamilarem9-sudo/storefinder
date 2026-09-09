@@ -24,6 +24,7 @@ from detection.shopify_detector import detect_shopify
 from discovery.candidate_manager import prepare_candidates
 from discovery.domain_discovery import discover_candidates
 from discovery.freshness import assess_freshness, lookup_earliest_certificate, meets_minimum
+from utils.countries import country_allows, country_label, normalize_country
 from utils.http import fetch_public
 from utils.normalization import is_junk_store_domain, is_usable_shop_domain, normalize_domain, now_iso, website_url
 
@@ -36,6 +37,8 @@ def run_cycle(
     max_domains: int | None = None,
     min_freshness: str | None = None,
     enable_secondary: bool | None = None,
+    target_countries: list[str] | None = None,
+    keep_unknown_country: bool | None = None,
 ) -> dict:
     """
     Run one automatic discovery cycle.
@@ -46,6 +49,8 @@ def run_cycle(
         config.MAX_DOMAINS_PER_CYCLE,
         config.MIN_FRESHNESS_LEVEL,
         config.ENABLE_SECONDARY_SOURCES,
+        list(config.TARGET_COUNTRIES),
+        config.KEEP_UNKNOWN_COUNTRY,
     )
     if max_domains is not None:
         config.MAX_DOMAINS_PER_CYCLE = max_domains
@@ -53,6 +58,10 @@ def run_cycle(
         config.MIN_FRESHNESS_LEVEL = min_freshness
     if enable_secondary is not None:
         config.ENABLE_SECONDARY_SOURCES = enable_secondary
+    if target_countries is not None:
+        config.TARGET_COUNTRIES = [item.upper() for item in target_countries if item]
+    if keep_unknown_country is not None:
+        config.KEEP_UNKNOWN_COUNTRY = keep_unknown_country
 
     def log(message: str) -> None:
         print(message)
@@ -79,9 +88,19 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v6")
+        log("Discovery engine v7")
         log("Discovery started. A run is complete only after a qualifying store is saved.")
         log("Stores from earlier runs are excluded and will not be checked again.")
+        if config.TARGET_COUNTRIES:
+            labels = ", ".join(country_label(code) for code in config.TARGET_COUNTRIES)
+            log(f"Country filter: {labels}.")
+            log(
+                "Unknown published country: "
+                + ("keep" if config.KEEP_UNKNOWN_COUNTRY else "reject")
+                + ". Country comes from public store pages only."
+            )
+        else:
+            log("Country filter: all countries.")
 
         seen_this_run: set[str] = set(known_domains(connection))
         stats["skipped_seen"] = len(seen_this_run)
@@ -147,6 +166,8 @@ def run_cycle(
             config.MAX_DOMAINS_PER_CYCLE,
             config.MIN_FRESHNESS_LEVEL,
             config.ENABLE_SECONDARY_SOURCES,
+            config.TARGET_COUNTRIES,
+            config.KEEP_UNKNOWN_COUNTRY,
         ) = previous
 
 
@@ -213,13 +234,12 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         }
     )
     log(f"  Freshness: {freshness.freshness_level} ({freshness.freshness_score})")
-
-    if freshness.freshness_level == "HIGH":
-        stats["high"] += 1
-    elif freshness.freshness_level == "MEDIUM":
-        stats["medium"] += 1
-    else:
-        stats["low"] += 1
+    published_country = contacts.get("country") or ""
+    country_code = normalize_country(published_country)
+    log(
+        f"  Country: {published_country or 'not published'}"
+        + (f" ({country_code})" if country_code else "")
+    )
 
     record = {
         **contacts,
@@ -232,6 +252,35 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         "freshness_level": freshness.freshness_level,
         "freshness_evidence": f"{candidate.evidence} {freshness.freshness_evidence}".strip(),
     }
+
+    allowed, country_reason = country_allows(
+        published_country,
+        config.TARGET_COUNTRIES,
+        config.KEEP_UNKNOWN_COUNTRY,
+    )
+    if not allowed:
+        record["reject_reason"] = country_reason
+        record["freshness_evidence"] = (
+            f"{record['freshness_evidence']} Public country "
+            f"{published_country or 'was not published'} "
+            "and did not match the selected countries."
+        ).strip()
+        upsert_rejected(connection, record)
+        stats["this_run_rejected_domains"].append(final_domain)
+        if country_reason == "country_unknown":
+            log("  Status: rejected (no published country)")
+        else:
+            log("  Status: rejected (country outside selected list)")
+        if final_domain != domain:
+            mark_processed(connection, domain, "SHOPIFY", candidate.source)
+        return
+
+    if freshness.freshness_level == "HIGH":
+        stats["high"] += 1
+    elif freshness.freshness_level == "MEDIUM":
+        stats["medium"] += 1
+    else:
+        stats["low"] += 1
 
     if meets_minimum(freshness.freshness_level, config.MIN_FRESHNESS_LEVEL):
         if record.get("public_email"):

@@ -19,10 +19,12 @@ import streamlit as st
 
 from config import (
     ENABLE_SECONDARY_SOURCES,
+    KEEP_UNKNOWN_COUNTRY,
     MAX_DOMAINS_PER_CYCLE,
     MIN_FRESHNESS_LEVEL,
     OUTPUT_FILE,
     REJECTED_FILE,
+    TARGET_COUNTRIES,
 )
 import importlib
 
@@ -36,19 +38,24 @@ from database.database import (
     load_leads_frame,
     load_rejected_frame,
 )
+from utils.countries import COUNTRY_CHOICES, country_label
 
 
 def _load_run_cycle():
     """Reload discovery modules so Streamlit does not keep a stale empty engine."""
     import importlib
 
+    import contact.public_contact_finder
     import database.database
     import discovery.candidate_manager
     import discovery.discovery_sources
     import discovery.domain_discovery
     import pipeline
+    import utils.countries
 
     importlib.reload(database.database)
+    importlib.reload(utils.countries)
+    importlib.reload(contact.public_contact_finder)
     importlib.reload(discovery.discovery_sources)
     importlib.reload(discovery.domain_discovery)
     importlib.reload(discovery.candidate_manager)
@@ -120,6 +127,30 @@ with st.sidebar:
         value=bool(ENABLE_SECONDARY_SOURCES),
         help="Off by default. Secondary sources usually find existing stores, not new launches.",
     )
+    all_countries = st.checkbox(
+        "All countries",
+        value=not bool(TARGET_COUNTRIES),
+        help="Discovery is still global. Country is read from public store pages after a site is checked.",
+    )
+    selected_country_codes: list[str] = []
+    if not all_countries:
+        selected_country_codes = st.multiselect(
+            "Countries to keep",
+            options=[code for code, _name in COUNTRY_CHOICES],
+            default=list(TARGET_COUNTRIES) or ["NG", "US", "GB", "CA", "AU"],
+            format_func=country_label,
+            help="A store is kept only when its public page publishes one of these countries.",
+        )
+        keep_unknown_country = st.checkbox(
+            "Keep stores with no published country",
+            value=bool(KEEP_UNKNOWN_COUNTRY),
+            help="Many Shopify stores never publish a country. Turn this off to reject those.",
+        )
+    else:
+        keep_unknown_country = True
+    st.caption(
+        "Country is never guessed from Shopify hosting IPs or a myshopify.com name."
+    )
     st.divider()
     run_clicked = st.button("Run discovery cycle", type="primary", width="stretch")
     st.caption(
@@ -159,6 +190,8 @@ if run_clicked:
             max_domains=max_domains,
             min_freshness=min_freshness,
             enable_secondary=enable_secondary,
+            target_countries=[] if all_countries else selected_country_codes,
+            keep_unknown_country=keep_unknown_country,
         )
     st.session_state.logs = logs
     st.session_state.last_stats = result
@@ -176,7 +209,7 @@ if run_clicked:
         st.session_state.flash_kind = "warning"
         st.session_state.flash = (
             f"Discovery did not complete. No store met the {min_freshness} freshness bar "
-            "this run. Open Rejected candidates and the Activity log."
+            "and country filter this run. Open Rejected candidates and the Activity log."
         )
     else:
         st.session_state.flash_kind = "warning"
@@ -377,5 +410,6 @@ Public sources → automatic store discovery → Shopify detection → freshness
 
 Primary sources: recent crt.sh certificates, urlscan.io public scans, and Cert Spotter.
 None of them can guarantee a store launched on a specific date.
+Country is copied from public store pages only when the user filters by country.
 """
 )
