@@ -1,6 +1,24 @@
+import sys
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from backend.app import create_app
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shopify-lead-finder"))
+
+
+def test_project_scoped_storage_paths_are_separate():
+    from config import project_storage_paths
+
+    a = project_storage_paths(user_id="user-1", project_id="project-1")
+    b = project_storage_paths(user_id="user-1", project_id="project-2")
+    c = project_storage_paths(user_id="user-2", project_id="project-1")
+
+    assert a["db"] != b["db"]
+    assert a["db"] != c["db"]
+    assert "user-1" in str(a["db"])
+    assert "project-1" in str(a["db"])
 
 
 def test_user_can_sign_up_and_create_project(tmp_path):

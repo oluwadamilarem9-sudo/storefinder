@@ -84,7 +84,7 @@ def _csv_bytes(path: Path, fallback: pd.DataFrame) -> bytes:
     return fallback.to_csv(index=False).encode("utf-8")
 
 
-BACKEND_URL = "http://127.0.0.1:8001"
+BACKEND_URL = "http://127.0.0.1:8000"
 
 
 def _backend_request(path: str, *, method: str = "GET", payload: dict | None = None, token: str | None = None):

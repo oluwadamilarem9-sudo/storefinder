@@ -1,0 +1,2 @@
+--requirement backend/requirements.txt
+--requirement shopify-lead-finder/requirements.txt
