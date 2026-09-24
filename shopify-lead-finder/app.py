@@ -17,6 +17,8 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
+import uuid
 
 from config import (
     ENABLE_SECONDARY_SOURCES,
@@ -198,53 +200,32 @@ st.caption(
 
 with st.sidebar:
     st.header("Account")
-    if not st.session_state.auth_token:
-        with st.form("auth_form"):
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
-            login_col, signup_col = st.columns(2)
-            login_clicked = login_col.form_submit_button("Login")
-            signup_clicked = signup_col.form_submit_button("Sign up")
-
-            if login_clicked and email and password:
-                try:
-                    user = _backend_request(
-                        "/auth/login",
-                        method="POST",
-                        payload={"email": email, "password": password},
-                    )
-                    st.session_state.auth_token = user["token"]
-                    st.session_state.backend_user = user["user"]
-                    st.session_state.backend_projects = []
-                    st.session_state.selected_project_id = None
-                    st.rerun()
-                except RuntimeError as exc:
-                    st.error(str(exc))
-
-            if signup_clicked and email and password:
-                try:
-                    user = _backend_request(
-                        "/auth/signup",
-                        method="POST",
-                        payload={"name": email.split("@")[0], "email": email, "password": password},
-                    )
-                    st.session_state.auth_token = user["token"]
-                    st.session_state.backend_user = user["user"]
-                    st.session_state.backend_projects = []
-                    st.session_state.selected_project_id = None
-                    st.rerun()
-                except RuntimeError as exc:
-                    st.error(str(exc))
-    else:
-        user = st.session_state.backend_user or {}
-        st.write(f"Signed in as: {user.get('name', 'User')}")
-        st.write(user.get('email', ''))
-        if st.button("Logout"):
-            st.session_state.auth_token = None
-            st.session_state.backend_user = None
-            st.session_state.selected_project_id = None
+    cookie_manager = stx.CookieManager()
+    cookies = cookie_manager.get_all()
+    
+    device_id = cookies.get("device_id")
+    if device_id is None:
+        device_id = str(uuid.uuid4())
+        cookie_manager.set("device_id", device_id, max_age=365*24*60*60)
+        
+    if device_id and not st.session_state.auth_token:
+        try:
+            user = _backend_request(
+                "/auth/device",
+                method="POST",
+                payload={"device_id": device_id},
+            )
+            st.session_state.auth_token = user["token"]
+            st.session_state.backend_user = user["user"]
             st.session_state.backend_projects = []
-            st.rerun()
+            st.session_state.selected_project_id = None
+        except RuntimeError as exc:
+            st.error(f"Device recognition failed: {exc}")
+
+    if st.session_state.auth_token:
+        user = st.session_state.backend_user or {}
+        st.write("Device recognized automatically.")
+        st.caption(f"Device User: {user.get('email', '')}")
 
         with st.form("project_form"):
             project_name = st.text_input("New project name")

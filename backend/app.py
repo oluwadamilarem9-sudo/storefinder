@@ -106,6 +106,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class DeviceLoginRequest(BaseModel):
+    device_id: str
+
+
 class ProjectCreateRequest(BaseModel):
     name: str
 
@@ -258,6 +262,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
         user = db.query(User).filter(User.email == payload.email.lower()).first()
         if not user or not verify_password(payload.password, user.password_hash):
             raise HTTPException(status_code=401, detail="Invalid credentials")
+        return {"token": create_auth_token(user), "user": {"id": user.id, "name": user.name, "email": user.email}}
+
+    @app.post("/auth/device")
+    def device_login(payload: DeviceLoginRequest, db: Session = Depends(get_db)):
+        from sqlalchemy.exc import IntegrityError
+        # Use a dummy email derived from device_id
+        email = f"{payload.device_id}@device.local"
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            try:
+                user = User(
+                    name="Anonymous Device",
+                    email=email,
+                    password_hash=hash_password(payload.device_id)
+                )
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+            except IntegrityError:
+                db.rollback()
+                user = db.query(User).filter(User.email == email).first()
+                if not user:
+                    raise HTTPException(status_code=500, detail="Could not create or fetch device user.")
         return {"token": create_auth_token(user), "user": {"id": user.id, "name": user.name, "email": user.email}}
 
     @app.get("/projects")

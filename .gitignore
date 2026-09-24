@@ -1,25 +1,3 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Virtual env
-.venv/
-venv/
-
-# Backup files
-*.bak
-*.db.bak.*
-leads.bak.*
-leads.db.bak.*
-storefinder.db.bak
-
-# Project data and outputs
-shopify-lead-finder/project_data/
-shopify-lead-finder/output/
-
-# Env files
-.env
 .venv/
 __pycache__/
 *.py[cod]
@@ -31,3 +9,10 @@ __pycache__/
 *.sqlite3
 .DS_Store
 Thumbs.db
+
+*.bak
+*.backup.py
+project_data/
+
+*.bak.*
+*.csv
