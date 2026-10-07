@@ -15,21 +15,36 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import importlib.util
+
 import pandas as pd
 import requests
 import streamlit as st
 
-from config import (
-    ENABLE_SECONDARY_SOURCES,
-    MAX_DOMAINS_PER_CYCLE,
-    MIN_FRESHNESS_LEVEL,
-    NEW_STORE_DAYS,
-    NEW_STORE_HIGH_DAYS,
-    OUTPUT_FILE,
-    REJECTED_FILE,
-    TARGET_COUNTRIES,
-    project_storage_paths,
-)
+
+def _load_app_config():
+    """Load this app's config.py, not another module named config."""
+    path = ROOT / "config.py"
+    spec = importlib.util.spec_from_file_location("leadfinder_config", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load settings from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["leadfinder_config"] = module
+    spec.loader.exec_module(module)
+    sys.modules["config"] = module
+    return module
+
+
+_config = _load_app_config()
+ENABLE_SECONDARY_SOURCES = _config.ENABLE_SECONDARY_SOURCES
+MAX_DOMAINS_PER_CYCLE = _config.MAX_DOMAINS_PER_CYCLE
+MIN_FRESHNESS_LEVEL = _config.MIN_FRESHNESS_LEVEL
+NEW_STORE_DAYS = _config.NEW_STORE_DAYS
+NEW_STORE_HIGH_DAYS = _config.NEW_STORE_HIGH_DAYS
+OUTPUT_FILE = _config.OUTPUT_FILE
+REJECTED_FILE = _config.REJECTED_FILE
+TARGET_COUNTRIES = _config.TARGET_COUNTRIES
+project_storage_paths = _config.project_storage_paths
 import importlib
 
 import database.database as dbmod

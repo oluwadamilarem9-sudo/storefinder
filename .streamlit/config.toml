@@ -1,0 +1,3 @@
+[client]
+# Community Cloud hides exception text unless this is on.
+showErrorDetails = true
