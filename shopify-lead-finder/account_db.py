@@ -89,7 +89,13 @@ def database_url() -> str:
             url = ""
     if not url:
         return ""
-    if url.startswith(("postgresql://", "postgres://")) and "sslmode" not in url:
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://") :]
+    if url.startswith("postgresql+psycopg2://"):
+        url = "postgresql+psycopg://" + url[len("postgresql+psycopg2://") :]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    if url.startswith("postgresql") and "sslmode" not in url:
         join = "&" if "?" in url else "?"
         url = f"{url}{join}sslmode=require"
     return url
