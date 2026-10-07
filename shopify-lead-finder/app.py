@@ -8,6 +8,7 @@ to paste store URLs.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 
 ROOT = Path(__file__).resolve().parent
@@ -139,7 +140,18 @@ def _csv_bytes(path: Path, fallback: pd.DataFrame) -> bytes:
     return fallback.to_csv(index=False).encode("utf-8")
 
 
-BACKEND_URL = "http://127.0.0.1:8000"
+def _resolve_backend_url() -> str:
+    """Use the live API on Streamlit Cloud. Local runs keep localhost."""
+    url = os.environ.get("BACKEND_URL", "").strip()
+    if not url:
+        try:
+            url = str(st.secrets["BACKEND_URL"]).strip()
+        except Exception:
+            url = ""
+    return (url or "http://127.0.0.1:8000").rstrip("/")
+
+
+BACKEND_URL = _resolve_backend_url()
 
 
 def _backend_request(path: str, *, method: str = "GET", payload: dict | None = None, token: str | None = None):
@@ -252,6 +264,7 @@ st.caption(
 
 with st.sidebar:
     st.header("Account")
+    st.caption(f"Account API: {BACKEND_URL}")
     if not st.session_state.auth_token:
         with st.form("auth_form"):
             email = st.text_input("Email")
