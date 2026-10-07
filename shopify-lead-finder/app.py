@@ -155,6 +155,10 @@ BACKEND_URL = _resolve_backend_url()
 
 
 def _backend_request(path: str, *, method: str = "GET", payload: dict | None = None, token: str | None = None):
+    import account_db
+
+    if account_db.using_database():
+        return account_db.handle(path, method, payload, token)
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -264,7 +268,12 @@ st.caption(
 
 with st.sidebar:
     st.header("Account")
-    st.caption(f"Account API: {BACKEND_URL}")
+    import account_db
+
+    if account_db.using_database():
+        st.caption("Account database: Supabase")
+    else:
+        st.caption(f"Account API: {BACKEND_URL}")
     if not st.session_state.auth_token:
         with st.form("auth_form"):
             email = st.text_input("Email")
