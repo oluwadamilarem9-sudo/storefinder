@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import config
-from contact.public_contact_finder import find_public_contacts, maybe_rdap_created
+from contact.public_contact_finder import find_public_contacts
 from database.database import (
     connect,
     export_csv,
@@ -23,7 +23,7 @@ from database.database import (
 from detection.shopify_detector import detect_shopify
 from discovery.candidate_manager import prepare_candidates
 from discovery.domain_discovery import discover_candidates
-from discovery.freshness import assess_freshness, lookup_earliest_certificate, meets_minimum
+from discovery.freshness import meets_minimum, prove_new_store
 from utils.countries import country_allows, country_label, normalize_country
 from utils.http import fetch_public
 from utils.normalization import is_junk_store_domain, is_usable_shop_domain, normalize_domain, now_iso, website_url
@@ -91,8 +91,13 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v8")
-        log("Discovery started. A run is complete only after a qualifying store is saved.")
+        log("Discovery engine v11")
+        log(
+            "A lead is a new store only: public proof it appeared within "
+            f"{config.NEW_STORE_DAYS} days, plus a public email and a published country."
+        )
+        log("Found today is not launched today.")
+        log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
             log("This run uses only the signed-in project's history.")
         log("Stores from earlier runs in this project are excluded and will not be checked again.")
@@ -105,7 +110,8 @@ def run_cycle(
                 + ". Country comes from public store pages only."
             )
         else:
-            log("Country filter: all countries.")
+            log("Country filter: any country the store publishes.")
+        log("Stores with no public email are rejected.")
 
         seen_this_run: set[str] = set(known_domains(connection))
         stats["skipped_seen"] = len(seen_this_run)
@@ -114,22 +120,16 @@ def run_cycle(
                 f"Skipping {len(seen_this_run)} store(s) already used in earlier runs."
             )
         max_domains = config.MAX_DOMAINS_PER_CYCLE
-        max_passes = 3
+        stats["requested"] = max_domains
+        log(f"Websites to check this run: {max_domains}.")
 
-        for attempt in range(1, max_passes + 1):
-            if _qualifying_count(stats) > 0 or stats["checked"] >= max_domains:
-                break
-            if attempt > 1:
-                log(
-                    f"No qualifying store yet. Continuing discovery "
-                    f"(pass {attempt}/{max_passes})..."
-                )
-
+        while stats["checked"] < max_domains:
+            remaining = max_domains - stats["checked"]
             raw_candidates = discover_candidates(
-                limit_per_source=max_domains,
+                limit_per_source=remaining,
                 on_log=log,
                 exclude_domains=seen_this_run,
-                min_unused=max(1, max_domains - stats["checked"]),
+                min_unused=remaining,
             )
             stats["candidates"] += len(raw_candidates)
             if not raw_candidates:
@@ -141,11 +141,13 @@ def run_cycle(
                 item
                 for item in ready
                 if item.domain not in seen_this_run
-            ][: max_domains - stats["checked"]]
+            ][:remaining]
 
             log(f"Unused websites to check this pass: {len(to_check)}")
             if not to_check:
-                log("No unused websites remain from public sources.")
+                log(
+                    f"Public sources ran out after {stats['checked']} of {max_domains} websites."
+                )
                 break
 
             for candidate in to_check:
@@ -157,10 +159,11 @@ def run_cycle(
                 except Exception as exc:
                     log(f"  Error on {candidate.domain}: {exc}")
                     mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
-                if _qualifying_count(stats) > 0 and stats["checked"] >= max_domains:
+                if stats["checked"] >= max_domains:
                     break
 
-        stats["complete"] = _qualifying_count(stats) > 0
+        stats["count_complete"] = stats["checked"] >= max_domains
+        stats["complete"] = len(stats["this_run_lead_domains"]) > 0
         export_csv(connection, leads_csv)
         export_rejected_csv(connection, rejected_csv)
         _log_summary(connection, stats, log)
@@ -220,25 +223,6 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
 
     stats["shopify"] += 1
     contacts = find_public_contacts(final_domain, homepage.text)
-    earliest_cert = ""
-    rdap_created = ""
-    if not config.FAST_MODE:
-        earliest_cert = lookup_earliest_certificate(final_domain)
-        rdap_created = maybe_rdap_created(final_domain)
-
-    freshness = assess_freshness(
-        {
-            "source": candidate.source,
-            "source_kind": candidate.extra.get("source_kind", ""),
-            "discovered_at": candidate.discovered_at,
-            "cert_not_before": candidate.extra.get("cert_not_before", ""),
-            "earliest_cert": earliest_cert,
-            "rdap_created": rdap_created,
-            "homepage_html": homepage.text,
-            "store_name": contacts.get("store_name", ""),
-        }
-    )
-    log(f"  Freshness: {freshness.freshness_level} ({freshness.freshness_score})")
     published_country = contacts.get("country") or ""
     country_code = normalize_country(published_country)
     log(
@@ -253,9 +237,9 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         "discovery_source": candidate.source,
         "source_url": candidate.source_url,
         "discovered_at": candidate.discovered_at or now_iso(),
-        "freshness_score": freshness.freshness_score,
-        "freshness_level": freshness.freshness_level,
-        "freshness_evidence": f"{candidate.evidence} {freshness.freshness_evidence}".strip(),
+        "freshness_score": 0,
+        "freshness_level": "UNKNOWN",
+        "freshness_evidence": "",
     }
 
     allowed, country_reason = country_allows(
@@ -266,10 +250,10 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
     if not allowed:
         record["reject_reason"] = country_reason
         record["freshness_evidence"] = (
-            f"{record['freshness_evidence']} Public country "
+            "Public country "
             f"{published_country or 'was not published'} "
             "and did not match the selected countries."
-        ).strip()
+        )
         upsert_rejected(connection, record)
         stats["this_run_rejected_domains"].append(final_domain)
         if country_reason == "country_unknown":
@@ -280,41 +264,69 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             mark_processed(connection, domain, "SHOPIFY", candidate.source)
         return
 
-    if freshness.freshness_level == "HIGH":
-        stats["high"] += 1
-    elif freshness.freshness_level == "MEDIUM":
-        stats["medium"] += 1
-    else:
-        stats["low"] += 1
+    if not (record.get("public_email") or "").strip():
+        record["reject_reason"] = "no_public_email"
+        record["freshness_evidence"] = "No public business email was displayed."
+        upsert_rejected(connection, record)
+        stats["this_run_rejected_domains"].append(final_domain)
+        log("  Status: rejected (no public business email)")
+        if final_domain != domain:
+            mark_processed(connection, domain, "SHOPIFY", candidate.source)
+        return
 
-    if meets_minimum(freshness.freshness_level, config.MIN_FRESHNESS_LEVEL):
-        if record.get("public_email"):
-            stats["emails"] += 1
-            log(f"  Email: {record['public_email']}")
-        else:
-            log("  Email: none publicly displayed")
-        upsert_lead(connection, record)
-        stats["this_run_lead_domains"].append(final_domain)
-        log("  Status: saved to leads.csv")
-    else:
+    newness = prove_new_store(final_domain, homepage.text)
+    record["freshness_score"] = newness.freshness_score
+    record["freshness_level"] = newness.freshness_level
+    record["freshness_evidence"] = newness.evidence
+    log(f"  New store check: {newness.freshness_level} ({newness.evidence})")
+
+    if not newness.is_new:
+        record["reject_reason"] = "not_a_new_store"
+        upsert_rejected(connection, record)
+        stats["this_run_rejected_domains"].append(final_domain)
+        log("  Status: rejected (not a new store)")
+        if final_domain != domain:
+            mark_processed(connection, domain, "SHOPIFY", candidate.source)
+        return
+
+    if not meets_minimum(newness.freshness_level, config.MIN_FRESHNESS_LEVEL):
         record["reject_reason"] = "below_freshness_threshold"
         upsert_rejected(connection, record)
         stats["this_run_rejected_domains"].append(final_domain)
-        log("  Status: rejected (freshness below threshold)")
+        log("  Status: rejected (older than the selected new-store window)")
+        if final_domain != domain:
+            mark_processed(connection, domain, "SHOPIFY", candidate.source)
+        return
+
+    if newness.freshness_level == "HIGH":
+        stats["high"] += 1
+    else:
+        stats["medium"] += 1
+    stats["emails"] += 1
+    log(f"  Email: {record['public_email']}")
+    upsert_lead(connection, record)
+    stats["this_run_lead_domains"].append(final_domain)
+    log("  Status: saved to leads.csv")
 
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
 
 
 def _qualifying_count(stats: dict) -> int:
-    return int(stats.get("high") or 0) + int(stats.get("medium") or 0)
+    return len(stats.get("this_run_lead_domains") or [])
 
 
 def _log_summary(connection, stats: dict, log: LogFn) -> None:
     saved = _qualifying_count(stats)
     log("========================================")
     log(f"Candidates discovered: {stats['candidates']}")
-    log(f"Websites checked this run: {stats['checked']}")
+    log(f"Websites checked this run: {stats['checked']} of {stats.get('requested') or stats['checked']}")
+    if stats.get("count_complete"):
+        log(f"Checked all {stats.get('requested') or stats['checked']} websites requested for this run.")
+    else:
+        log(
+            "Public sources ran out before the requested number of websites was checked."
+        )
     log(f"Shopify stores: {stats['shopify']}")
     log(f"High freshness: {stats['high']}")
     log(f"Medium freshness: {stats['medium']}")
@@ -324,12 +336,12 @@ def _log_summary(connection, stats: dict, log: LogFn) -> None:
     log(f"Excluded from earlier runs: {stats['skipped_seen']}")
 
     if saved > 0:
-        log(f"Discovery found {saved} qualifying HIGH/MEDIUM store(s) this run.")
+        log(f"Discovery found {saved} new store(s) with a public email and a published country.")
         this_run = stats.get("this_run_lead_domains") or []
         for index, domain in enumerate(this_run, start=1):
             log(f"{index}. https://{domain}")
     else:
-        log("Discovery did not complete: no HIGH/MEDIUM store was saved this run.")
+        log("Discovery did not complete: no new store had a public email, a matching country, and public proof it appeared recently.")
 
     log(f"Qualifying leads: {config.OUTPUT_FILE}")
     log(f"Rejected candidates: {config.REJECTED_FILE}")

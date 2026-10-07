@@ -47,14 +47,19 @@ def discover_candidates(
     discovered.extend(_run_sources(active_sources(), cap, log, exclude))
 
     unused = _unused_count(discovered, exclude)
-    if unused < min_unused:
+    if unused == 0:
         log("Primary sources had no unused websites. Trying public fallback indexes...")
         discovered.extend(_run_sources(fallback_sources(), cap, log, exclude))
         unused = _unused_count(discovered, exclude)
 
-    if unused < min_unused:
+    if unused == 0:
         log("Every public source was empty, blocked, or already checked.")
     else:
+        if unused < min_unused:
+            log(
+                f"This pass found {unused} unused website(s). "
+                f"The run still needs {min_unused}."
+            )
         log(f"Discovery found {len(discovered)} candidate hostname(s), {unused} unused.")
     return discovered
 
@@ -76,7 +81,7 @@ def _run_sources(sources, cap: int, log: LogFn, exclude: set[str]) -> list[Disco
     for source in sources:
         log(f"  Source: {source.name} ({source.tier})")
         try:
-            batch = source.discover(limit=max(cap, 100))
+            batch = source.discover(limit=max(cap, 100), exclude=exclude)
         except Exception as exc:
             log(f"  Skipping {source.name} ({exc}).")
             continue

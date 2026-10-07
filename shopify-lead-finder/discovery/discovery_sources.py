@@ -54,7 +54,7 @@ class PublicDiscoverySource:
     name = "base"
     tier = "primary"
 
-    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list[DiscoveredCandidate]:
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
         raise NotImplementedError
 
 
@@ -75,7 +75,7 @@ class CrtShRecentCertificateSource(PublicDiscoverySource):
     atom_url = "https://crt.sh/atom?q=%.myshopify.com"
     json_url = "https://crt.sh/?q=%.myshopify.com&output=json&exclude=expired"
 
-    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list[DiscoveredCandidate]:
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
         result = fetch_public(
             self.atom_url,
             accept="application/atom+xml, application/xml, text/xml",
@@ -214,14 +214,22 @@ class UrlscanRecentSource(PublicDiscoverySource):
         "page.server:Shopify",
     )
 
-    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list[DiscoveredCandidate]:
+    def __init__(self) -> None:
+        self._search_after: dict[str, list] = {}
+        self._exhausted: set[str] = set()
+
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
         found: list[DiscoveredCandidate] = []
         seen: set[str] = set()
+        blocked = {normalize_domain(item) for item in (exclude or set()) if item}
         last_error = ""
+        page_budget = min(80, max(8, (limit // 50) + 6))
 
         for query in self.queries:
-            search_after = None
-            for _page in range(3):
+            if query in self._exhausted or len(found) >= limit:
+                continue
+            search_after = self._search_after.get(query)
+            for _page in range(page_budget):
                 if len(found) >= limit:
                     break
                 url = (
@@ -234,11 +242,15 @@ class UrlscanRecentSource(PublicDiscoverySource):
                 if payload is None:
                     break
                 results = payload.get("results") or []
-                self._collect(payload, url, found, seen, limit)
+                self._collect(payload, url, found, seen, limit, blocked)
                 sort_key = results[-1].get("sort") if results else None
-                if not results or not isinstance(sort_key, list) or len(found) >= limit:
+                if not results or not isinstance(sort_key, list):
+                    self._exhausted.add(query)
                     break
                 search_after = sort_key
+                self._search_after[query] = search_after
+                if len(found) >= limit:
+                    break
 
         if not found and last_error:
             print(f"  Skipping {self.name} ({last_error}).")
@@ -281,12 +293,14 @@ class UrlscanRecentSource(PublicDiscoverySource):
         found: list[DiscoveredCandidate],
         seen: set[str],
         limit: int,
+        blocked: set[str] | None = None,
     ) -> None:
+        skipped = blocked or set()
         for row in payload.get("results", []):
             page = row.get("page") or {}
             task = row.get("task") or {}
             host = normalize_domain(page.get("domain") or task.get("domain") or "")
-            if not is_usable_shop_domain(host) or is_junk_store_domain(host) or host in seen:
+            if not is_usable_shop_domain(host) or is_junk_store_domain(host) or host in seen or host in skipped:
                 continue
             if not host.endswith(".myshopify.com"):
                 server = str(page.get("server") or "").lower()
@@ -332,7 +346,7 @@ class CertSpotterRecentSource(PublicDiscoverySource):
         "?domain=myshopify.com&include_subdomains=true&expand=dns_names"
     )
 
-    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list[DiscoveredCandidate]:
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
         result = fetch_public(
             self.api_url,
             accept="application/json",
@@ -397,7 +411,7 @@ class CommonCrawlSource(PublicDiscoverySource):
     tier = "secondary"
     collections_url = "https://index.commoncrawl.org/collinfo.json"
 
-    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list[DiscoveredCandidate]:
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
         collections = fetch_public(
             self.collections_url,
             accept="application/json",
@@ -447,7 +461,7 @@ class WaybackMachineSource(PublicDiscoverySource):
     name = "wayback_machine"
     tier = "secondary"
 
-    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list[DiscoveredCandidate]:
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
         year = datetime.now(timezone.utc).year
         query = (
             "https://web.archive.org/cdx/search/cdx"
@@ -504,7 +518,7 @@ class HackerNewsPublicApiSource(PublicDiscoverySource):
     tier = "secondary"
     api_url = "https://hn.algolia.com/api/v1/search?query=myshopify.com&hitsPerPage=20"
 
-    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE) -> list[DiscoveredCandidate]:
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
         result = fetch_public(
             self.api_url,
             accept="application/json",

@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from config import (
+    NEW_STORE_DAYS,
+    NEW_STORE_HIGH_DAYS,
     RDAP_HIGH_DAYS,
     RDAP_MEDIUM_DAYS,
     RECENT_CERT_DAYS,
@@ -244,6 +246,199 @@ def _established_year(html: str) -> int | None:
     for match in ESTABLISHED_YEAR.findall(html or ""):
         years.append(int(match))
     return min(years) if years else None
+
+
+@dataclass
+class NewStoreResult:
+    is_new: bool
+    freshness_level: str
+    freshness_score: int
+    evidence: str
+    age_days: int | None = None
+
+
+def judge_new_store(
+    *,
+    rdap_created: datetime | None,
+    certificate_dates: list[datetime],
+    certificate_history_complete: bool,
+    earliest_archive: datetime | None,
+    archive_lookup_ok: bool,
+    homepage_html: str,
+    now: datetime | None = None,
+) -> NewStoreResult:
+    """
+    Decide whether public records show a new store.
+
+    A positive result needs a domain registration or a complete earliest
+    certificate inside the window, and no older public record.
+    """
+    now = now or datetime.now(timezone.utc)
+    notes: list[str] = []
+    negatives: list[str] = []
+    positives: list[tuple[int, str]] = []
+
+    old_year = _established_year(homepage_html)
+    if old_year and old_year <= now.year - 2:
+        negatives.append(
+            f"Public page mentions {old_year}, which is an established site."
+        )
+
+    if rdap_created:
+        age = _age_days(now, rdap_created)
+        dated = rdap_created.date().isoformat()
+        if age <= NEW_STORE_DAYS:
+            positives.append((age, f"Domain registered on {dated} ({age} days ago)."))
+        else:
+            negatives.append(
+                f"Domain registered on {dated}, older than {NEW_STORE_DAYS} days."
+            )
+
+    if certificate_dates and certificate_history_complete:
+        earliest = min(certificate_dates)
+        age = _age_days(now, earliest)
+        dated = earliest.date().isoformat()
+        if age <= NEW_STORE_DAYS:
+            positives.append((age, f"Earliest public certificate is {dated} ({age} days ago)."))
+        else:
+            negatives.append(
+                f"Earliest public certificate is {dated}, older than {NEW_STORE_DAYS} days."
+            )
+    elif certificate_dates:
+        if any(_age_days(now, item) > NEW_STORE_DAYS for item in certificate_dates):
+            negatives.append(
+                "Certificate history includes a date older than the new-store window."
+            )
+        else:
+            notes.append(
+                "Certificate history was incomplete, so a recent certificate is not treated as a new store."
+            )
+    else:
+        notes.append("No complete public certificate history was available.")
+
+    if archive_lookup_ok and earliest_archive:
+        age = _age_days(now, earliest_archive)
+        dated = earliest_archive.date().isoformat()
+        if age > NEW_STORE_DAYS:
+            negatives.append(
+                f"Web archive first captured this site on {dated}, older than {NEW_STORE_DAYS} days."
+            )
+        else:
+            notes.append(
+                f"Web archive first capture on {dated} is recent. That alone is not a launch date."
+            )
+    elif not archive_lookup_ok:
+        notes.append("Web archive lookup did not answer.")
+
+    if negatives:
+        evidence = " ".join(negatives + notes)
+        return NewStoreResult(False, "LOW", 0, evidence)
+
+    if not positives:
+        evidence = (
+            "No public proof this store appeared within "
+            f"{NEW_STORE_DAYS} days. Found today is not launched today. "
+            + " ".join(notes)
+        ).strip()
+        return NewStoreResult(False, "UNKNOWN", 0, evidence)
+
+    age_days = min(item[0] for item in positives)
+    level = "HIGH" if age_days <= NEW_STORE_HIGH_DAYS else "MEDIUM"
+    evidence = " ".join([item[1] for item in positives] + notes)
+    return NewStoreResult(
+        True,
+        level,
+        80 if level == "HIGH" else 55,
+        evidence,
+        age_days,
+    )
+
+
+def prove_new_store(domain: str, homepage_html: str = "") -> NewStoreResult:
+    """Look up public age records, then judge them. Never invents a launch date."""
+    from contact.public_contact_finder import maybe_rdap_created
+
+    dates, complete = _certificate_history(domain)
+    rdap_raw = maybe_rdap_created(domain)
+    archive, archive_ok = _earliest_archive(domain)
+    return judge_new_store(
+        rdap_created=parse_loose_date(rdap_raw) if rdap_raw else None,
+        certificate_dates=dates,
+        certificate_history_complete=complete,
+        earliest_archive=archive,
+        archive_lookup_ok=archive_ok,
+        homepage_html=homepage_html,
+    )
+
+
+def _certificate_history(domain: str) -> tuple[list[datetime], bool]:
+    """Return certificate dates and whether the history looks complete."""
+    if not domain:
+        return [], False
+    result = fetch_public(
+        f"https://crt.sh/?q={domain}&output=json",
+        accept="application/json",
+        max_bytes=500_000,
+        timeout=max(SOURCE_TIMEOUT, 20),
+        allow_cross_domain_redirect=True,
+        check_robots=False,
+    )
+    if not result.ok:
+        return [], False
+    text = result.text.strip()
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError:
+        return [], False
+    if not isinstance(rows, list):
+        return [], False
+    dates: list[datetime] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parsed = parse_loose_date(str(row.get("not_before") or row.get("entry_timestamp") or ""))
+        if parsed:
+            dates.append(parsed)
+    complete = text.endswith("]") and len(text) < 490_000
+    return dates, complete
+
+
+def _earliest_archive(domain: str) -> tuple[datetime | None, bool]:
+    """First public web-archive capture. (None, True) means no capture was found."""
+    if not domain:
+        return None, False
+    result = fetch_public(
+        "https://web.archive.org/cdx/search/cdx"
+        f"?url={domain}/*&output=json&fl=timestamp&limit=1&filter=statuscode:200",
+        accept="application/json",
+        max_bytes=20_000,
+        timeout=max(SOURCE_TIMEOUT, 20),
+        allow_cross_domain_redirect=True,
+        check_robots=False,
+    )
+    if result.error == "404" or (result.ok and result.text.strip() in {"", "[]"}):
+        return None, True
+    if not result.ok:
+        return None, False
+    try:
+        rows = json.loads(result.text)
+    except json.JSONDecodeError:
+        return None, False
+    if not isinstance(rows, list) or not rows:
+        return None, True
+    stamp = ""
+    for row in rows:
+        value = str(row[0] if isinstance(row, list) and row else row)
+        if value.isdigit() and len(value) >= 8:
+            stamp = value
+            break
+    if not stamp:
+        return None, True
+    try:
+        found = datetime.strptime(stamp[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None, False
+    return found, True
 
 
 def _age_days(now: datetime, value: datetime) -> int:

@@ -157,13 +157,11 @@ def country_allows(
     Returns (allowed, reason). reason is empty when allowed.
     """
     wanted = {item.upper() for item in target_codes if item}
-    if not wanted:
-        return True, ""
     code = normalize_country(published)
     if not code:
         if keep_unknown:
             return True, ""
         return False, "country_unknown"
-    if code in wanted:
+    if not wanted or code in wanted:
         return True, ""
     return False, "country_mismatch"

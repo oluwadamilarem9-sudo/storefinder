@@ -21,9 +21,10 @@ import streamlit as st
 
 from config import (
     ENABLE_SECONDARY_SOURCES,
-    KEEP_UNKNOWN_COUNTRY,
     MAX_DOMAINS_PER_CYCLE,
     MIN_FRESHNESS_LEVEL,
+    NEW_STORE_DAYS,
+    NEW_STORE_HIGH_DAYS,
     OUTPUT_FILE,
     REJECTED_FILE,
     TARGET_COUNTRIES,
@@ -261,8 +262,8 @@ def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, 
 
 st.title("Shopify Public Lead Finder")
 st.caption(
-    "Automatically discovers candidate Shopify websites from public sources, "
-    "scores freshness, and saves publicly displayed business contacts. "
+    "Automatically discovers candidate Shopify websites from public sources "
+    "and keeps only new stores with a public email and a published country. "
     "You do not paste store URLs."
 )
 
@@ -372,12 +373,18 @@ with st.sidebar:
         max_value=10000,
         value=min(int(MAX_DOMAINS_PER_CYCLE), 10000),
         step=5,
-        help="How many discovered websites to visit this cycle. Public sources may return fewer than this in one run.",
+        help="The run visits this many websites. It does not stop when the first lead is saved.",
     )
     min_freshness = st.selectbox(
-        "Minimum freshness for leads.csv",
+        "How new the store must be",
         options=["HIGH", "MEDIUM"],
         index=0 if MIN_FRESHNESS_LEVEL == "HIGH" else 1,
+        format_func=lambda level: (
+            f"HIGH — public proof from the last {NEW_STORE_HIGH_DAYS} days"
+            if level == "HIGH"
+            else f"MEDIUM — public proof from the last {NEW_STORE_DAYS} days"
+        ),
+        help="A store is saved only when a domain registration or the earliest certificate proves it appeared in this window. Found today is not launched today.",
     )
     enable_secondary = st.checkbox(
         "Include secondary sources (Hacker News, Wayback, Common Crawl)",
@@ -387,9 +394,10 @@ with st.sidebar:
     all_countries = st.checkbox(
         "All countries",
         value=not bool(TARGET_COUNTRIES),
-        help="Discovery is still global. Country is read from public store pages after a site is checked.",
+        help="A lead still needs a country published on the store. This chooses which published countries to keep.",
     )
     selected_country_codes: list[str] = []
+    keep_unknown_country = False
     if not all_countries:
         selected_country_codes = st.multiselect(
             "Countries to keep",
@@ -398,21 +406,15 @@ with st.sidebar:
             format_func=country_label,
             help="A store is kept only when its public page publishes one of these countries.",
         )
-        keep_unknown_country = st.checkbox(
-            "Keep stores with no published country",
-            value=bool(KEEP_UNKNOWN_COUNTRY),
-            help="Many Shopify stores never publish a country. Turn this off to reject those.",
-        )
-    else:
-        keep_unknown_country = True
     st.caption(
+        "A lead is a new store with a public business email and a country published on the store. "
         "Country is never guessed from Shopify hosting IPs or a myshopify.com name."
     )
     st.divider()
     run_clicked = st.button("Run discovery cycle", type="primary", width="stretch")
     st.caption(
-        "Fast mode is on: shorter waits, fewer extra pages, and no slow "
-        "certificate/RDAP lookups during the cycle."
+        "Each checked store is tested against public domain, certificate, and archive dates. "
+        "Fast mode only shortens the contact-page visits."
     )
 
 storage = _project_storage()
@@ -513,19 +515,28 @@ if run_clicked:
         except RuntimeError as exc:
             st.warning(f"Project sync warning: {exc}")
 
-    saved = int(result.get("high") or 0) + int(result.get("medium") or 0)
+    saved = len(result.get("this_run_lead_domains") or [])
+    checked = int(result.get("checked") or 0)
+    requested = int(result.get("requested") or checked)
+    count_done = bool(result.get("count_complete"))
+    count_line = (
+        f"Checked all {requested} websites."
+        if count_done
+        else f"Checked {checked} of {requested} websites. Public sources ran out."
+    )
     complete = bool(result.get("complete")) and saved > 0
     if complete:
         st.session_state.flash_kind = "success"
         st.session_state.flash = (
-            f"Discovery found {saved} qualifying HIGH/MEDIUM store(s) this run. "
-            "Open the Qualifying leads tab."
+            f"Discovery found {saved} new store(s) with a public email and a published country. "
+            f"{count_line} Open the Qualifying leads tab."
         )
     elif result.get("checked"):
         st.session_state.flash_kind = "warning"
         st.session_state.flash = (
-            f"Discovery did not complete. No store met the {min_freshness} freshness bar "
-            "and country filter this run. Open Rejected candidates and the Activity log."
+            "Discovery did not complete. No new store had a public email, a matching "
+            "published country, and public proof it appeared recently. "
+            f"{count_line} Open Rejected candidates and the Activity log."
         )
     else:
         st.session_state.flash_kind = "warning"
@@ -556,7 +567,7 @@ leads_tab, rejected_tab = st.tabs(
 with leads_tab:
     st.subheader("Qualifying leads from this run")
     st.write(
-        "Only stores found in this project are shown here. "
+        "Only new stores from this project with a public email and a published country are shown. "
         "Another account's cycles are not included. "
         "Emails are copied from public pages only."
     )
@@ -721,11 +732,10 @@ st.markdown(
     """
 **How this works**
 
-Public sources → automatic store discovery → Shopify detection → freshness scoring
-→ public contact discovery → SQLite + CSV.
+Public sources → Shopify check → new-store proof → public email and country
+→ save for this project only.
 
-Primary sources: recent crt.sh certificates, urlscan.io public scans, and Cert Spotter.
-None of them can guarantee a store launched on a specific date.
-Country is copied from public store pages only when the user filters by country.
+A store is new only when its domain registration or earliest certificate is inside the selected window, and no older archive or certificate contradicts that. A page found today is not a launch date.
+Country is copied from the store's own public pages.
 """
 )

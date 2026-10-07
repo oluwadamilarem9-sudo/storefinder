@@ -43,8 +43,10 @@ SOURCE_TIMEOUT = 10
 FAST_MODE = True
 MAX_EXTRA_PAGES = 2
 
-# A recent certificate means the hostname recently appeared in CT logs.
-# It is not a Shopify launch date. Let's Encrypt also renews old stores.
+# A store is new only with public proof it appeared inside this window.
+# Found today is not launched today. A certificate renewal is not a launch.
+NEW_STORE_DAYS = 60
+NEW_STORE_HIGH_DAYS = 30
 RECENT_CERT_DAYS = 21
 RDAP_HIGH_DAYS = 60
 RDAP_MEDIUM_DAYS = 180
@@ -53,9 +55,9 @@ RDAP_MEDIUM_DAYS = 180
 # Leave this False so they cannot flood the lead list.
 ENABLE_SECONDARY_SOURCES = False
 
-# Empty list means every country. Country is taken from public store pages only.
+# Empty list means every published country. A blank country is not a lead.
 TARGET_COUNTRIES: list[str] = []
-KEEP_UNKNOWN_COUNTRY = True
+KEEP_UNKNOWN_COUNTRY = False
 
 USER_AGENT = (
     "ShopifyLeadFinder/1.0 "
