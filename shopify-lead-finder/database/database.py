@@ -155,6 +155,26 @@ def _rehome_unscored_leads(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
+def remember_domains(
+    connection: sqlite3.Connection,
+    domains: list[str],
+    source: str = "account_history",
+) -> int:
+    """Remember domains this project already used, without copying another user's file."""
+    from utils.normalization import normalize_domain
+
+    known = known_domains(connection)
+    added = 0
+    for raw in domains:
+        domain = normalize_domain(str(raw or ""))
+        if not domain or domain in known:
+            continue
+        mark_processed(connection, domain, "UNKNOWN", source)
+        known.add(domain)
+        added += 1
+    return added
+
+
 def known_domains(connection: sqlite3.Connection) -> set[str]:
     """Every domain already used in any earlier discovery cycle."""
     seen: set[str] = set()

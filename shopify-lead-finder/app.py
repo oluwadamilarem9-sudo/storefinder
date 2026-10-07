@@ -17,8 +17,6 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 import requests
 import streamlit as st
-import extra_streamlit_components as stx
-import uuid
 
 from config import (
     ENABLE_SECONDARY_SOURCES,
@@ -28,6 +26,7 @@ from config import (
     OUTPUT_FILE,
     REJECTED_FILE,
     TARGET_COUNTRIES,
+    project_storage_paths,
 )
 import importlib
 
@@ -40,6 +39,7 @@ from database.database import (
     delete_rejected,
     load_leads_frame,
     load_rejected_frame,
+    remember_domains,
 )
 from utils.countries import COUNTRY_CHOICES, country_label
 
@@ -72,10 +72,63 @@ st.set_page_config(
 )
 
 
-def _load_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
-    connection = connect()
+def _project_storage():
+    user = st.session_state.get("backend_user") or {}
+    project_id = st.session_state.get("selected_project_id")
+    user_id = user.get("id")
+    if not user_id or not project_id:
+        return None
+    return project_storage_paths(str(user_id), str(project_id))
+
+
+def _load_tables(db_path: Path | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if db_path is None:
+        return pd.DataFrame(), pd.DataFrame()
+    connection = connect(db_path)
     try:
         return load_leads_frame(connection), load_rejected_frame(connection)
+    finally:
+        connection.close()
+
+
+def _merge_account_rows(local: pd.DataFrame, remote_rows: list, rename: dict | None = None) -> pd.DataFrame:
+    remote = pd.DataFrame(remote_rows or [])
+    if rename and not remote.empty:
+        remote = remote.rename(columns=rename)
+    if remote.empty:
+        return local
+    if local.empty or "domain" not in local.columns:
+        return remote
+    known = set(local["domain"].astype(str))
+    extra = remote[~remote["domain"].astype(str).isin(known)]
+    if extra.empty:
+        return local
+    return pd.concat([local, extra], ignore_index=True)
+
+
+def _load_project_tables(storage: dict, token: str, project_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    leads_df, rejected_df = _load_tables(storage["db"])
+    try:
+        remote_leads = _backend_request(f"/projects/{project_id}/leads", token=token)
+        remote_rejected = _backend_request(f"/projects/{project_id}/rejected", token=token)
+    except RuntimeError:
+        return leads_df, rejected_df
+    leads_df = _merge_account_rows(leads_df, remote_leads, {"source": "discovery_source"})
+    rejected_df = _merge_account_rows(rejected_df, remote_rejected, {"reason": "reject_reason"})
+    return leads_df, rejected_df
+
+
+def _seed_project_history(storage: dict, token: str, project_id: str) -> None:
+    remote_leads = _backend_request(f"/projects/{project_id}/leads", token=token)
+    remote_rejected = _backend_request(f"/projects/{project_id}/rejected", token=token)
+    domains = [
+        item.get("domain")
+        for item in list(remote_leads or []) + list(remote_rejected or [])
+        if item.get("domain")
+    ]
+    connection = connect(storage["db"])
+    try:
+        remember_domains(connection, domains)
     finally:
         connection.close()
 
@@ -86,9 +139,7 @@ def _csv_bytes(path: Path, fallback: pd.DataFrame) -> bytes:
     return fallback.to_csv(index=False).encode("utf-8")
 
 
-import os
-
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://127.0.0.1:8000")
+BACKEND_URL = "http://127.0.0.1:8000"
 
 
 def _backend_request(path: str, *, method: str = "GET", payload: dict | None = None, token: str | None = None):
@@ -150,8 +201,8 @@ if "backend_run_id" not in st.session_state:
     st.session_state.backend_run_id = None
 
 
-def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, token: str):
-    current_leads = _load_tables()[0]
+def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, token: str, db_path: Path):
+    current_leads, rejected_df = _load_tables(db_path)
     lead_domains = set((result.get("this_run_lead_domains") or []))
     if lead_domains:
         lead_rows = current_leads[current_leads["domain"].astype(str).isin(lead_domains)]
@@ -175,7 +226,6 @@ def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, 
 
     rejected_domains = set((result.get("this_run_rejected_domains") or []))
     if rejected_domains:
-        _, rejected_df = _load_tables()
         rejected_rows = rejected_df[rejected_df["domain"].astype(str).isin(rejected_domains)]
         for _, row in rejected_rows.iterrows():
             payload = {
@@ -202,32 +252,53 @@ st.caption(
 
 with st.sidebar:
     st.header("Account")
-    cookie_manager = stx.CookieManager()
-    cookies = cookie_manager.get_all()
-    
-    device_id = cookies.get("device_id")
-    if device_id is None:
-        device_id = str(uuid.uuid4())
-        cookie_manager.set("device_id", device_id, max_age=365*24*60*60)
-        
-    if device_id and not st.session_state.auth_token:
-        try:
-            user = _backend_request(
-                "/auth/device",
-                method="POST",
-                payload={"device_id": device_id},
-            )
-            st.session_state.auth_token = user["token"]
-            st.session_state.backend_user = user["user"]
-            st.session_state.backend_projects = []
-            st.session_state.selected_project_id = None
-        except RuntimeError as exc:
-            st.error(f"Device recognition failed: {exc}")
+    if not st.session_state.auth_token:
+        with st.form("auth_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            login_col, signup_col = st.columns(2)
+            login_clicked = login_col.form_submit_button("Login")
+            signup_clicked = signup_col.form_submit_button("Sign up")
 
-    if st.session_state.auth_token:
+            if login_clicked and email and password:
+                try:
+                    user = _backend_request(
+                        "/auth/login",
+                        method="POST",
+                        payload={"email": email, "password": password},
+                    )
+                    st.session_state.auth_token = user["token"]
+                    st.session_state.backend_user = user["user"]
+                    st.session_state.backend_projects = []
+                    st.session_state.selected_project_id = None
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
+            if signup_clicked and email and password:
+                try:
+                    user = _backend_request(
+                        "/auth/signup",
+                        method="POST",
+                        payload={"name": email.split("@")[0], "email": email, "password": password},
+                    )
+                    st.session_state.auth_token = user["token"]
+                    st.session_state.backend_user = user["user"]
+                    st.session_state.backend_projects = []
+                    st.session_state.selected_project_id = None
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+    else:
         user = st.session_state.backend_user or {}
-        st.write("Device recognized automatically.")
-        st.caption(f"Device User: {user.get('email', '')}")
+        st.write(f"Signed in as: {user.get('name', 'User')}")
+        st.write(user.get('email', ''))
+        if st.button("Logout"):
+            st.session_state.auth_token = None
+            st.session_state.backend_user = None
+            st.session_state.selected_project_id = None
+            st.session_state.backend_projects = []
+            st.rerun()
 
         with st.form("project_form"):
             project_name = st.text_input("New project name")
@@ -322,7 +393,17 @@ with st.sidebar:
         "certificate/RDAP lookups during the cycle."
     )
 
-leads_df, rejected_df = _load_tables()
+storage = _project_storage()
+if storage is None:
+    leads_df, rejected_df = pd.DataFrame(), pd.DataFrame()
+else:
+    leads_df, rejected_df = _load_project_tables(
+        storage,
+        st.session_state.auth_token,
+        st.session_state.selected_project_id,
+    )
+leads_csv = storage["leads_csv"] if storage else OUTPUT_FILE
+rejected_csv = storage["rejected_csv"] if storage else REJECTED_FILE
 stats = st.session_state.last_stats or {}
 qualifying_count = 0 if leads_df.empty else len(leads_df)
 rejected_count = 0 if rejected_df.empty else len(rejected_df)
@@ -352,6 +433,16 @@ if run_clicked:
         log_box.code("\n".join(logs[-40:]), language="text")
 
     project_id = st.session_state.get("selected_project_id")
+    storage = _project_storage()
+    if storage is None:
+        st.warning("Please sign in and create/select a project before running discovery.")
+        st.stop()
+    try:
+        _seed_project_history(storage, st.session_state.auth_token, project_id)
+    except RuntimeError as exc:
+        st.warning(f"This project's history could not be loaded: {exc}")
+        st.stop()
+
     backend_run = None
     if project_id and st.session_state.auth_token:
         try:
@@ -379,6 +470,9 @@ if run_clicked:
             enable_secondary=enable_secondary,
             target_countries=[] if all_countries else selected_country_codes,
             keep_unknown_country=keep_unknown_country,
+            db_path=storage["db"],
+            leads_csv=storage["leads_csv"],
+            rejected_csv=storage["rejected_csv"],
         )
     st.session_state.logs = logs
     st.session_state.last_stats = result
@@ -392,6 +486,7 @@ if run_clicked:
                 st.session_state.backend_run_id,
                 result,
                 token=st.session_state.auth_token,
+                db_path=storage["db"],
             )
         except RuntimeError as exc:
             st.warning(f"Project sync warning: {exc}")
@@ -439,8 +534,8 @@ leads_tab, rejected_tab = st.tabs(
 with leads_tab:
     st.subheader("Qualifying leads from this run")
     st.write(
-        "Only stores found in the latest run are shown here. "
-        "Earlier runs stay in the database but are never checked again. "
+        "Only stores found in this project are shown here. "
+        "Another account's cycles are not included. "
         "Emails are copied from public pages only."
     )
     show_earlier_leads = st.checkbox(
@@ -494,7 +589,7 @@ with leads_tab:
         with lead_download_col:
             st.download_button(
                 "Download leads.csv",
-                data=_csv_bytes(OUTPUT_FILE, leads_df),
+                data=_csv_bytes(leads_csv, leads_df),
                 file_name="leads.csv",
                 mime="text/csv",
                 width="stretch",
@@ -503,7 +598,7 @@ with leads_tab:
             if not selected_leads:
                 st.warning("Select at least one qualifying lead first.")
             else:
-                connection = connect()
+                connection = connect(storage["db"])
                 try:
                     removed = delete_leads(connection, selected_leads)
                 finally:
@@ -512,7 +607,7 @@ with leads_tab:
                 st.session_state.flash = f"Deleted {removed} qualifying lead(s)."
                 st.rerun()
         if delete_all_leads:
-            connection = connect()
+            connection = connect(storage["db"])
             try:
                 removed = delete_leads(connection, None)
             finally:
@@ -520,7 +615,7 @@ with leads_tab:
             st.session_state.flash_kind = "success"
             st.session_state.flash = f"Deleted all {removed} qualifying lead(s)."
             st.rerun()
-        st.caption(f"Also saved on disk at `{OUTPUT_FILE}`")
+        st.caption("Saved for this project only.")
 
 with rejected_tab:
     st.subheader("Rejected candidates from this run")
@@ -571,7 +666,7 @@ with rejected_tab:
         with download_col:
             st.download_button(
                 "Download rejected_candidates.csv",
-                data=_csv_bytes(REJECTED_FILE, rejected_df),
+                data=_csv_bytes(rejected_csv, rejected_df),
                 file_name="rejected_candidates.csv",
                 mime="text/csv",
                 width="stretch",
@@ -580,7 +675,7 @@ with rejected_tab:
             if not selected:
                 st.warning("Select at least one rejected domain first.")
             else:
-                connection = connect()
+                connection = connect(storage["db"])
                 try:
                     removed = delete_rejected(connection, selected)
                 finally:
@@ -589,7 +684,7 @@ with rejected_tab:
                 st.session_state.flash = f"Deleted {removed} rejected candidate(s)."
                 st.rerun()
         if delete_all:
-            connection = connect()
+            connection = connect(storage["db"])
             try:
                 removed = delete_rejected(connection, None)
             finally:
@@ -597,7 +692,7 @@ with rejected_tab:
             st.session_state.flash_kind = "success"
             st.session_state.flash = f"Deleted all {removed} rejected candidate(s)."
             st.rerun()
-        st.caption(f"Also saved on disk at `{REJECTED_FILE}`")
+        st.caption("Saved for this project only.")
 
 st.divider()
 st.markdown(

@@ -6,6 +6,7 @@ Change these values in this file. There are no paid APIs or cloud keys.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -60,3 +61,24 @@ USER_AGENT = (
     "ShopifyLeadFinder/1.0 "
     "(local public-research tool; respects robots.txt; no login)"
 )
+
+
+def project_storage_paths(user_id: str, project_id: str) -> dict[str, Path]:
+    """Files for one signed-in project. Never the shared leads.db."""
+    safe_user = _safe_storage_id(user_id)
+    safe_project = _safe_storage_id(project_id)
+    root = ROOT / "project_data" / "users" / safe_user / "projects" / safe_project
+    root.mkdir(parents=True, exist_ok=True)
+    return {
+        "root": root,
+        "db": root / "leads.db",
+        "leads_csv": root / "leads.csv",
+        "rejected_csv": root / "rejected_candidates.csv",
+    }
+
+
+def _safe_storage_id(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", value or "")
+    if not cleaned:
+        raise ValueError("A user id and project id are required for project storage.")
+    return cleaned

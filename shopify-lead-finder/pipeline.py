@@ -39,6 +39,9 @@ def run_cycle(
     enable_secondary: bool | None = None,
     target_countries: list[str] | None = None,
     keep_unknown_country: bool | None = None,
+    db_path=None,
+    leads_csv=None,
+    rejected_csv=None,
 ) -> dict:
     """
     Run one automatic discovery cycle.
@@ -83,14 +86,16 @@ def run_cycle(
         "this_run_rejected_domains": [],
     }
 
-    connection = connect()
+    connection = connect(db_path)
     try:
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v7")
+        log("Discovery engine v8")
         log("Discovery started. A run is complete only after a qualifying store is saved.")
-        log("Stores from earlier runs are excluded and will not be checked again.")
+        if db_path is not None:
+            log("This run uses only the signed-in project's history.")
+        log("Stores from earlier runs in this project are excluded and will not be checked again.")
         if config.TARGET_COUNTRIES:
             labels = ", ".join(country_label(code) for code in config.TARGET_COUNTRIES)
             log(f"Country filter: {labels}.")
@@ -156,8 +161,8 @@ def run_cycle(
                     break
 
         stats["complete"] = _qualifying_count(stats) > 0
-        export_csv(connection)
-        export_rejected_csv(connection)
+        export_csv(connection, leads_csv)
+        export_rejected_csv(connection, rejected_csv)
         _log_summary(connection, stats, log)
         return stats
     finally:
