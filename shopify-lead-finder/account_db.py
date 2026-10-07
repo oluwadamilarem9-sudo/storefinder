@@ -89,12 +89,10 @@ def database_url() -> str:
             url = ""
     if not url:
         return ""
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://") :]
-    if url.startswith("postgresql+psycopg2://"):
-        url = "postgresql+psycopg://" + url[len("postgresql+psycopg2://") :]
-    elif url.startswith("postgresql://"):
-        url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        if scheme in {"postgres", "postgresql", "postgresql+psycopg", "postgresql+psycopg2"}:
+            url = "postgresql+psycopg2://" + rest
     if url.startswith("postgresql") and "sslmode" not in url:
         join = "&" if "?" in url else "?"
         url = f"{url}{join}sslmode=require"
@@ -114,7 +112,10 @@ def handle(path: str, method: str, payload: dict | None, token: str | None):
         try:
             return _route(session, path, method.upper(), payload or {}, token or "")
         finally:
-            session.close()
+            try:
+                session.close()
+            except Exception:
+                pass
     except RuntimeError:
         raise
     except Exception as exc:
@@ -123,10 +124,11 @@ def handle(path: str, method: str, payload: dict | None, token: str | None):
 
 def _session(url: str):
     global _engine, _Session
-    if _engine is None:
-        _engine = create_engine(url, pool_pre_ping=True)
-        Base.metadata.create_all(bind=_engine)
-        _Session = sessionmaker(bind=_engine)
+    if _Session is None:
+        engine = create_engine(url, pool_pre_ping=True)
+        Base.metadata.create_all(bind=engine)
+        _engine = engine
+        _Session = sessionmaker(bind=engine)
     return _Session()
 
 
