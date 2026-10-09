@@ -187,6 +187,26 @@ def known_domains(connection: sqlite3.Connection) -> set[str]:
     return seen
 
 
+def watched_password_domains(connection: sqlite3.Connection) -> list[str]:
+    """Shops still behind a password page. Later runs check these again."""
+    rows = connection.execute(
+        """
+        SELECT domain FROM rejected_candidates
+        WHERE reject_reason = 'password_page'
+        ORDER BY last_checked ASC
+        """
+    ).fetchall()
+    return [str(row["domain"]) for row in rows if row["domain"]]
+
+
+def clear_password_watch(connection: sqlite3.Connection, domain: str) -> None:
+    connection.execute(
+        "DELETE FROM rejected_candidates WHERE domain = ? AND reject_reason = 'password_page'",
+        (domain,),
+    )
+    connection.commit()
+
+
 def already_processed(
     connection: sqlite3.Connection,
     domain: str,
@@ -194,6 +214,8 @@ def already_processed(
 ) -> bool:
     """True when this domain was already part of a discovery cycle."""
     if not domain:
+        return False
+    if domain in set(watched_password_domains(connection)):
         return False
     for table in ("processed_domains", "leads", "rejected_candidates"):
         row = connection.execute(

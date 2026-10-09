@@ -125,7 +125,10 @@ def handle(path: str, method: str, payload: dict | None, token: str | None):
 def _session(url: str):
     global _engine, _Session
     if _Session is None:
-        engine = create_engine(url, pool_pre_ping=True)
+        kwargs = {"pool_pre_ping": True}
+        if url.startswith("sqlite"):
+            kwargs["connect_args"] = {"check_same_thread": False}
+        engine = create_engine(url, **kwargs)
         Base.metadata.create_all(bind=engine)
         _engine = engine
         _Session = sessionmaker(bind=engine)

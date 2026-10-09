@@ -19,10 +19,13 @@ from database.database import (
     mark_processed,
     upsert_lead,
     upsert_rejected,
+    watched_password_domains,
+    clear_password_watch,
 )
 from detection.shopify_detector import detect_shopify
 from detection.storefront_profile import inspect_storefront, is_password_page
 from discovery.candidate_manager import prepare_candidates
+from discovery.discovery_sources import DiscoveredCandidate
 from discovery.domain_discovery import discover_candidates
 from utils.countries import country_allows, country_label, normalize_country
 from utils.http import fetch_public
@@ -91,15 +94,14 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v12")
-        log(
-            "A lead is an operating Shopify shop with a public business email, "
-            "a published country, and real products in the public catalog."
-        )
+        log("Discovery engine v14")
+        log("New shops are watched from public signals, then saved when the store is open and has products.")
+        log("A password page is checked again on a later run. It is not published until the shop opens.")
         log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
             log("This run uses only the signed-in project's history.")
-        log("Stores from earlier runs in this project are excluded and will not be checked again.")
+        log("Finished shops from earlier runs are excluded and will not be checked again.")
+        log("Shops still behind a password page are watched and checked again.")
         if config.TARGET_COUNTRIES:
             labels = ", ".join(country_label(code) for code in config.TARGET_COUNTRIES)
             log(f"Country filter: {labels}.")
@@ -109,10 +111,11 @@ def run_cycle(
                 + ". Country comes from public store pages only."
             )
         else:
-            log("Country filter: any country the store publishes.")
-        log("Stores with no public email are rejected.")
+            log("Country filter: any published country. Shops that do not publish a country are still saved.")
+        log("A public email is stored when the shop displays one.")
 
-        seen_this_run: set[str] = set(known_domains(connection))
+        watching = watched_password_domains(connection)
+        seen_this_run: set[str] = set(known_domains(connection)) - set(watching)
         stats["skipped_seen"] = len(seen_this_run)
         if seen_this_run:
             log(
@@ -121,6 +124,25 @@ def run_cycle(
         max_domains = config.MAX_DOMAINS_PER_CYCLE
         stats["requested"] = max_domains
         log(f"Websites to check this run: {max_domains}.")
+        if watching:
+            log(f"Rechecking {len(watching)} shop(s) still behind a password page.")
+            for domain in watching:
+                if stats["checked"] >= max_domains:
+                    break
+                seen_this_run.add(domain)
+                stats["checked"] += 1
+                candidate = DiscoveredCandidate(
+                    domain=domain,
+                    source="password_watch",
+                    source_url="",
+                    discovered_at=now_iso(),
+                    evidence="Checked again after an earlier password page.",
+                )
+                try:
+                    _process_candidate(connection, candidate, stats["checked"], max_domains, stats, log)
+                except Exception as exc:
+                    log(f"  Error on {domain}: {exc}")
+                    mark_processed(connection, domain, "UNKNOWN", "password_watch")
 
         while stats["checked"] < max_domains:
             remaining = max_domains - stats["checked"]
@@ -232,58 +254,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             reason="password_page",
             evidence="The public page is a password wall or an opening-soon page.",
             log=log,
-            status="rejected (password page)",
-        )
-        return
-
-    contacts = find_public_contacts(final_domain, homepage.text)
-    published_country = contacts.get("country") or ""
-    country_code = normalize_country(published_country)
-    log(
-        f"  Country: {published_country or 'not published'}"
-        + (f" ({country_code})" if country_code else "")
-    )
-
-    allowed, country_reason = country_allows(
-        published_country,
-        config.TARGET_COUNTRIES,
-        config.KEEP_UNKNOWN_COUNTRY,
-    )
-    if not allowed:
-        if country_reason == "country_unknown":
-            status = "rejected (no published country)"
-        else:
-            status = "rejected (country outside selected list)"
-        _reject(
-            connection,
-            stats,
-            domain,
-            final_domain,
-            candidate,
-            contacts=contacts,
-            reason=country_reason,
-            evidence=(
-                "Public country "
-                f"{published_country or 'was not published'} "
-                "and did not match the selected countries."
-            ),
-            log=log,
-            status=status,
-        )
-        return
-
-    if not (contacts.get("public_email") or "").strip():
-        _reject(
-            connection,
-            stats,
-            domain,
-            final_domain,
-            candidate,
-            contacts=contacts,
-            reason="no_public_email",
-            evidence="No public business email was displayed.",
-            log=log,
-            status="rejected (no public business email)",
+            status="watching (password page, checked again next run)",
         )
         return
 
@@ -296,11 +267,11 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             domain,
             final_domain,
             candidate,
-            contacts=contacts,
+            contacts={},
             reason="password_page",
             evidence=profile.evidence(),
             log=log,
-            status="rejected (password page)",
+            status="watching (password page, checked again next run)",
         )
         return
     if not profile.product_names:
@@ -311,13 +282,49 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             domain,
             final_domain,
             candidate,
-            contacts=contacts,
+            contacts={},
             reason="no_public_products",
             evidence=profile.evidence(),
             log=log,
             status="rejected (no public products)",
         )
         return
+
+    contacts = find_public_contacts(final_domain, homepage.text)
+    published_country = contacts.get("country") or ""
+    country_code = normalize_country(published_country)
+    log(
+        f"  Country: {published_country or 'not published'}"
+        + (f" ({country_code})" if country_code else "")
+    )
+    if config.TARGET_COUNTRIES:
+        allowed, country_reason = country_allows(
+            published_country,
+            config.TARGET_COUNTRIES,
+            False,
+        )
+        if not allowed:
+            if country_reason == "country_unknown":
+                status = "rejected (no published country)"
+            else:
+                status = "rejected (country outside selected list)"
+            _reject(
+                connection,
+                stats,
+                domain,
+                final_domain,
+                candidate,
+                contacts=contacts,
+                reason=country_reason,
+                evidence=(
+                    "Public country "
+                    f"{published_country or 'was not published'} "
+                    "and did not match the selected countries."
+                ),
+                log=log,
+                status=status,
+            )
+            return
 
     record = {
         **contacts,
@@ -331,11 +338,15 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         "freshness_evidence": profile.evidence(),
     }
     stats["high"] += 1
-    stats["emails"] += 1
-    log(f"  Email: {record['public_email']}")
+    if (record.get("public_email") or "").strip():
+        stats["emails"] += 1
+        log(f"  Email: {record['public_email']}")
+    else:
+        log("  Email: not published on the store")
     upsert_lead(connection, record)
+    clear_password_watch(connection, final_domain)
     stats["this_run_lead_domains"].append(final_domain)
-    log("  Status: saved to leads.csv")
+    log("  Status: saved for download")
 
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
@@ -384,12 +395,12 @@ def _log_summary(connection, stats: dict, log: LogFn) -> None:
     log(f"Excluded from earlier runs: {stats['skipped_seen']}")
 
     if saved > 0:
-        log(f"Discovery found {saved} operating shop(s) with a public email, a published country, and public products.")
+        log(f"Scraped {saved} live shop(s). Download them from Newly scraped stores.")
         this_run = stats.get("this_run_lead_domains") or []
         for index, domain in enumerate(this_run, start=1):
             log(f"{index}. https://{domain}")
     else:
-        log("Discovery did not complete: no shop had a public email, a matching country, and public products.")
+        log("Discovery did not complete: no live shop with a public product catalog was saved.")
 
     log(f"Qualifying leads: {config.OUTPUT_FILE}")
     log(f"Rejected candidates: {config.REJECTED_FILE}")

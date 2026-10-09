@@ -274,8 +274,8 @@ def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, 
 
 st.title("Shopify Public Lead Finder")
 st.caption(
-    "Automatically discovers candidate Shopify websites from public sources "
-    "and keeps operating Shopify shops that show a public email, a published country, and real products. "
+    "Scrapes live Shopify shops from public sources. "
+    "A shop behind a password page is watched and listed for download after it opens and shows products. "
     "You do not paste store URLs."
 )
 
@@ -284,7 +284,11 @@ with st.sidebar:
     import account_db
 
     if account_db.using_database():
-        st.caption("Account database: Supabase")
+        url = account_db.database_url()
+        if url.startswith("sqlite"):
+            st.caption("Account database: local")
+        else:
+            st.caption("Account database: Supabase")
     else:
         st.caption(f"Account API: {BACKEND_URL}")
     if not st.session_state.auth_token:
@@ -388,7 +392,7 @@ with st.sidebar:
         help="The run visits this many websites. It does not stop when the first lead is saved.",
     )
     enable_secondary = st.checkbox(
-        "Include secondary sources (Hacker News, Wayback, Common Crawl)",
+        "Include extra sources (Wayback, Hacker News)",
         value=bool(ENABLE_SECONDARY_SOURCES),
         help="Off by default. These indexes list older mentions. A shop from them still needs a public email, a country, and products.",
     )
@@ -408,7 +412,8 @@ with st.sidebar:
             help="A store is kept only when its public page publishes one of these countries.",
         )
     st.caption(
-        "A lead is an operating shop with a public business email, a country published on the store, and real products. "
+        "A saved shop is a live store with public products. "
+        "Its email and country are filled in when the store publishes them. "
         "Country is never guessed from Shopify hosting IPs or a myshopify.com name."
     )
     st.divider()
@@ -527,14 +532,13 @@ if run_clicked:
     if complete:
         st.session_state.flash_kind = "success"
         st.session_state.flash = (
-            f"Discovery found {saved} operating shop(s) with a public email, a published country, and public products. "
+            f"Scraped {saved} live shop(s). Download them from Newly scraped stores. "
             f"{count_line} Open the Qualifying leads tab."
         )
     elif result.get("checked"):
         st.session_state.flash_kind = "warning"
         st.session_state.flash = (
-            "Discovery did not complete. No shop had a public email, a matching "
-            "published country, and public products. "
+            "Discovery did not complete. No live shop with a public product catalog was saved. "
             f"{count_line} Open Rejected candidates and the Activity log."
         )
     else:
@@ -558,17 +562,17 @@ with st.expander("Last cycle activity log", expanded=True):
 
 leads_tab, rejected_tab = st.tabs(
     [
-        f"This run leads ({this_run_saved})",
+        f"Newly scraped stores ({this_run_saved})",
         f"This run rejected ({len(st.session_state.this_run_rejected_domains)})",
     ]
 )
 
 with leads_tab:
-    st.subheader("Qualifying leads from this run")
+    st.subheader("Newly scraped stores")
     st.write(
-        "Only operating shops from this run with a public email, a published country, and public products are shown. "
-        "Another account's cycles are not included. "
-        "Emails are copied from public pages only."
+        "Live shops scraped in this run. Download this list. "
+        "Email and country appear when the store publishes them. "
+        "Another account's scrapes are not included."
     )
     show_earlier_leads = st.checkbox(
         "Also show saved leads from earlier runs",
@@ -585,18 +589,26 @@ with leads_tab:
     if view.empty:
         if show_earlier_leads:
             st.info(
-                "No qualifying shops are saved yet. "
-                "A run is complete only after a shop with a public email, a country, and products is found."
+                "No live shops are saved yet. "
+                "A run is complete only after a shop with public products is scraped."
             )
         else:
             st.info(
-                "This run has no new qualifying leads. "
-                "Earlier stores are hidden so they are not mixed into this cycle."
+                "This scrape has no new live shops. "
+                "Earlier stores are hidden so they are not mixed into this scrape."
             )
     else:
         email_only = st.checkbox("Show only rows with a public email", value=False)
         if email_only:
             view = view[view["public_email"].fillna("") != ""]
+        st.download_button(
+            "Download newly scraped stores",
+            data=view.to_csv(index=False).encode("utf-8"),
+            file_name="newly_scraped_stores.csv",
+            mime="text/csv",
+            width="stretch",
+            type="primary",
+        )
         st.dataframe(view, width="stretch", hide_index=True)
         lead_domains = view["domain"].dropna().astype(str).tolist()
         selected_leads = st.multiselect(
@@ -620,7 +632,7 @@ with leads_tab:
             )
         with lead_download_col:
             st.download_button(
-                "Download leads.csv",
+                "Download all saved shops",
                 data=_csv_bytes(leads_csv, leads_df),
                 file_name="leads.csv",
                 mime="text/csv",
@@ -731,11 +743,10 @@ st.markdown(
     """
 **How this works**
 
-Public sources → Shopify check → public products, email, and country
-→ save for this project only.
+Public sources → open the live shop → keep it when the public catalog has products
+→ show it under Newly scraped stores for download.
 
-A lead is a shop whose public pages show a business email, a country, and real products.
+Email and country are copied from the shop's own pages when they are published.
 A password wall or an empty catalog is rejected. Sales and revenue are not estimated.
-Country is copied from the store's own public pages.
 """
 )

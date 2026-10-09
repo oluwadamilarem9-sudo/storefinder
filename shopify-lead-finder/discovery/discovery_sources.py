@@ -209,6 +209,7 @@ class UrlscanRecentSource(PublicDiscoverySource):
     name = "urlscan_recent"
     tier = "primary"
     queries = (
+        "page.domain:myshopify.com AND page.status:200",
         "page.domain:myshopify.com",
         "domain:myshopify.com",
         "page.server:Shopify",
@@ -664,15 +665,15 @@ class PublicAdLibrarySource(PublicDiscoverySource):
 
 
 PRIMARY_SOURCES: list[PublicDiscoverySource] = [
+    UrlscanRecentSource(),
+    CommonCrawlSource(),
     PublicShopSearchSource(),
     PublicAdLibrarySource(),
-    UrlscanRecentSource(),
     CrtShRecentCertificateSource(),
     CertSpotterRecentSource(),
 ]
 
 SECONDARY_SOURCES: list[PublicDiscoverySource] = [
-    CommonCrawlSource(),
     WaybackMachineSource(),
     HackerNewsPublicApiSource(),
 ]

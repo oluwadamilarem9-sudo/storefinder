@@ -8,12 +8,12 @@ alwaysApply: true
 A cycle is complete only when this run saved at least one new qualifying store.
 
 - Never show "finished", "cycle finished", or equivalent success-complete copy unless that happened.
-- If sources were empty, blocked, all duplicates, robots-denied, or no store had a public email, a published country, and public products, the cycle did not complete. Say that. Point to the activity log and Rejected candidates.
+- If sources were empty, blocked, all duplicates, robots-denied, or no live shop with a public product catalog was saved, the cycle did not complete. Say that. Point to the activity log and Rejected candidates.
 - Check every website the user asked for. A run of 100 checks 100. A run of 1,000 checks 1,000. Saving a qualifying store does not stop the run early. Stop only when that count is checked or every available source is exhausted.
 - Do not treat leftover leads from an earlier run as proof this cycle succeeded.
-- Once a website is checked in any cycle, never include it in a later cycle. Skip it permanently, even if public sources list it again.
+- Once a website is checked in any cycle, never include it in a later cycle. Skip it permanently, even if public sources list it again. A shop still behind a password page is the exception: keep watching it and check it again until it opens or it is a dead site.
 - Do not ask the user to paste store URLs.
 - Do not invent launch dates. "Found today" is not "launched today."
-- A qualifying lead is a real Shopify shop with all three: a public business email written on the store, a country the store publishes that matches the selected countries, and real products in the public catalog. A password wall, an empty shop, a missing email, and a missing country go to rejected. Do not guess an email. The private Shopify account email is not public. Do not invent orders, revenue, ad spend, or traffic.
+- A downloadable store is a live Shopify shop with real products in the public catalog. A password wall and an empty shop go to rejected. A public email and a published country are copied onto the row when the store shows them. They are not invented. If the user selected countries, a shop is kept only when its published country matches. Do not invent orders, revenue, ad spend, or traffic. The private Shopify account email is not public.
 - Country filters use only a country the storefront publishes. Never infer country from Shopify CDN IPs, urlscan scanner location, or a myshopify.com hostname.
 - Public data only. Respect robots.txt on storefronts. No admin, CAPTCHA, or auth bypass.
