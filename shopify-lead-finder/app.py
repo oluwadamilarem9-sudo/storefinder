@@ -64,15 +64,21 @@ def _load_run_cycle():
 
     import contact.public_contact_finder
     import database.database
+    import detection.shopify_detector
+    import detection.storefront_profile
     import discovery.candidate_manager
     import discovery.discovery_sources
     import discovery.domain_discovery
     import pipeline
     import utils.countries
+    import utils.normalization
 
+    importlib.reload(utils.normalization)
     importlib.reload(database.database)
     importlib.reload(utils.countries)
     importlib.reload(contact.public_contact_finder)
+    importlib.reload(detection.shopify_detector)
+    importlib.reload(detection.storefront_profile)
     importlib.reload(discovery.discovery_sources)
     importlib.reload(discovery.domain_discovery)
     importlib.reload(discovery.candidate_manager)
@@ -275,7 +281,9 @@ def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, 
 st.title("Shopify Public Lead Finder")
 st.caption(
     "Scrapes live Shopify shops from public sources. "
-    "A shop behind a password page is watched and listed for download after it opens and shows products. "
+    "A shop behind a password page is watched. "
+    "Each check uses the shop's own domain, such as the brand's website. "
+    "A myshopify.com name is not checked and is not saved. "
     "You do not paste store URLs."
 )
 

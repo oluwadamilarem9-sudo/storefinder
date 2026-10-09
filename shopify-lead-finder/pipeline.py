@@ -7,6 +7,7 @@ contact finding. It only runs those existing modules in order.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 import config
@@ -23,7 +24,7 @@ from database.database import (
     clear_password_watch,
 )
 from detection.shopify_detector import detect_shopify
-from detection.storefront_profile import inspect_storefront, is_password_page
+from detection.storefront_profile import inspect_storefront, is_password_page, published_custom_domain
 from discovery.candidate_manager import prepare_candidates
 from discovery.discovery_sources import DiscoveredCandidate
 from discovery.domain_discovery import discover_candidates
@@ -94,8 +95,8 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v14")
-        log("New shops are watched from public signals, then saved when the store is open and has products.")
+        log("Discovery engine v16")
+        log("This run checks each shop on its own domain. A myshopify.com name is not checked and is not saved.")
         log("A password page is checked again on a later run. It is not published until the shop opens.")
         log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
@@ -114,7 +115,13 @@ def run_cycle(
             log("Country filter: any published country. Shops that do not publish a country are still saved.")
         log("A public email is stored when the shop displays one.")
 
-        watching = watched_password_domains(connection)
+        all_watching = watched_password_domains(connection)
+        watching = [
+            domain
+            for domain in all_watching
+            if not str(domain).endswith(".myshopify.com") and not str(domain).endswith(".shopify.com")
+        ]
+        myshopify_watches = len(all_watching) - len(watching)
         seen_this_run: set[str] = set(known_domains(connection)) - set(watching)
         stats["skipped_seen"] = len(seen_this_run)
         if seen_this_run:
@@ -124,13 +131,39 @@ def run_cycle(
         max_domains = config.MAX_DOMAINS_PER_CYCLE
         stats["requested"] = max_domains
         log(f"Websites to check this run: {max_domains}.")
+        if myshopify_watches:
+            log(
+                f"Leaving {myshopify_watches} myshopify.com name(s) off this run. "
+                "Only a shop's own domain is checked."
+            )
+        rate_streak = 0
+
+        def check_one(candidate) -> bool:
+            nonlocal rate_streak
+            if stats["checked"] >= max_domains or stats.get("slowed_down"):
+                return False
+            seen_this_run.add(candidate.domain)
+            stats["checked"] += 1
+            try:
+                counted = _process_candidate(connection, candidate, stats["checked"], max_domains, stats, log)
+            except Exception as exc:
+                log(f"  Error on {candidate.domain}: {exc}")
+                mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
+                counted = True
+            if counted:
+                rate_streak = 0
+                return stats["checked"] < max_domains
+            stats["checked"] -= 1
+            rate_streak += 1
+            if rate_streak >= 8:
+                stats["slowed_down"] = True
+                log("Storefronts asked us to slow down. Remaining shops stay for a later run.")
+                return False
+            return True
+
         if watching:
             log(f"Rechecking {len(watching)} shop(s) still behind a password page.")
             for domain in watching:
-                if stats["checked"] >= max_domains:
-                    break
-                seen_this_run.add(domain)
-                stats["checked"] += 1
                 candidate = DiscoveredCandidate(
                     domain=domain,
                     source="password_watch",
@@ -138,13 +171,10 @@ def run_cycle(
                     discovered_at=now_iso(),
                     evidence="Checked again after an earlier password page.",
                 )
-                try:
-                    _process_candidate(connection, candidate, stats["checked"], max_domains, stats, log)
-                except Exception as exc:
-                    log(f"  Error on {domain}: {exc}")
-                    mark_processed(connection, domain, "UNKNOWN", "password_watch")
+                if not check_one(candidate):
+                    break
 
-        while stats["checked"] < max_domains:
+        while stats["checked"] < max_domains and not stats.get("slowed_down"):
             remaining = max_domains - stats["checked"]
             raw_candidates = discover_candidates(
                 limit_per_source=remaining,
@@ -172,15 +202,7 @@ def run_cycle(
                 break
 
             for candidate in to_check:
-                seen_this_run.add(candidate.domain)
-                stats["checked"] += 1
-                index = stats["checked"]
-                try:
-                    _process_candidate(connection, candidate, index, max_domains, stats, log)
-                except Exception as exc:
-                    log(f"  Error on {candidate.domain}: {exc}")
-                    mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
-                if stats["checked"] >= max_domains:
+                if not check_one(candidate):
                     break
 
         stats["count_complete"] = stats["checked"] >= max_domains
@@ -200,19 +222,27 @@ def run_cycle(
         ) = previous
 
 
-def _process_candidate(connection, candidate, index: int, total: int, stats: dict, log: LogFn) -> None:
+def _fetch_storefront(domain: str):
+    homepage = fetch_public(website_url(domain), allow_cross_domain_redirect=True)
+    if homepage.error == "429":
+        time.sleep(8)
+        homepage = fetch_public(website_url(domain), allow_cross_domain_redirect=True)
+    return homepage
+
+
+def _process_candidate(connection, candidate, index: int, total: int, stats: dict, log: LogFn) -> bool:
     domain = candidate.domain
     log(f"[{index}/{total}] Checking {domain}")
 
-    homepage = fetch_public(
-        website_url(domain),
-        allow_cross_domain_redirect=True,
-    )
+    homepage = _fetch_storefront(domain)
 
     if not homepage.ok:
+        if homepage.error == "429":
+            log("  Status: slow down (429). This shop was not checked and will be tried later.")
+            return False
         log(f"  Status: skipped ({homepage.error})")
         mark_processed(connection, domain, "UNKNOWN", candidate.source)
-        return
+        return True
 
     final_domain = normalize_domain(homepage.final_url or domain)
     if not is_usable_shop_domain(final_domain) or is_junk_store_domain(final_domain):
@@ -230,7 +260,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             },
         )
         stats["this_run_rejected_domains"].append(final_domain or domain)
-        return
+        return True
 
     shopify_status = detect_shopify(homepage.text, homepage.headers)
     log(f"  Shopify: {shopify_status}")
@@ -240,7 +270,34 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         if final_domain != domain:
             mark_processed(connection, domain, shopify_status, candidate.source)
         log("  Status: discarded")
-        return
+        return True
+
+    custom_domain = published_custom_domain(final_domain, homepage.text)
+    if custom_domain and custom_domain != final_domain:
+        log(f"  Custom domain: {custom_domain}")
+        custom_home = fetch_public(
+            website_url(custom_domain),
+            allow_cross_domain_redirect=True,
+        )
+        if custom_home.ok:
+            homepage = custom_home
+            final_domain = normalize_domain(custom_home.final_url or custom_domain)
+        else:
+            final_domain = custom_domain
+    if str(final_domain).endswith(".myshopify.com") and not is_password_page(homepage.text):
+        _reject(
+            connection,
+            stats,
+            domain,
+            final_domain,
+            candidate,
+            contacts={},
+            reason="no_custom_domain",
+            evidence="The shop has not published a domain of its own. A myshopify.com name is not saved.",
+            log=log,
+            status="rejected (no custom domain)",
+        )
+        return True
 
     stats["shopify"] += 1
     if is_password_page(homepage.text):
@@ -256,7 +313,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             log=log,
             status="watching (password page, checked again next run)",
         )
-        return
+        return True
 
     profile = inspect_storefront(final_domain, homepage.text)
     log(f"  Catalog: {profile.evidence()}")
@@ -273,7 +330,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             log=log,
             status="watching (password page, checked again next run)",
         )
-        return
+        return True
     if not profile.product_names:
         stats["low"] += 1
         _reject(
@@ -288,7 +345,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
             log=log,
             status="rejected (no public products)",
         )
-        return
+        return True
 
     contacts = find_public_contacts(final_domain, homepage.text)
     published_country = contacts.get("country") or ""
@@ -324,7 +381,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
                 log=log,
                 status=status,
             )
-            return
+            return True
 
     record = {
         **contacts,
@@ -345,11 +402,14 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         log("  Email: not published on the store")
     upsert_lead(connection, record)
     clear_password_watch(connection, final_domain)
+    if domain != final_domain:
+        clear_password_watch(connection, domain)
     stats["this_run_lead_domains"].append(final_domain)
     log("  Status: saved for download")
 
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
+    return True
 
 
 def _reject(connection, stats, domain, final_domain, candidate, contacts, reason, evidence, log, status) -> None:
@@ -383,6 +443,8 @@ def _log_summary(connection, stats: dict, log: LogFn) -> None:
     log(f"Websites checked this run: {stats['checked']} of {stats.get('requested') or stats['checked']}")
     if stats.get("count_complete"):
         log(f"Checked all {stats.get('requested') or stats['checked']} websites requested for this run.")
+    elif stats.get("slowed_down"):
+        log("Storefronts asked us to slow down before the requested number of websites was checked.")
     else:
         log(
             "Public sources ran out before the requested number of websites was checked."

@@ -13,7 +13,7 @@ from __future__ import annotations
 from config import RECHECK_AFTER_DAYS
 from database.database import already_processed, is_new_domain
 from discovery.discovery_sources import DiscoveredCandidate
-from utils.normalization import is_junk_store_domain, is_usable_shop_domain, normalize_domain
+from utils.normalization import is_custom_shop_domain, normalize_domain
 
 
 def prepare_candidates(
@@ -31,7 +31,7 @@ def prepare_candidates(
 
     for item in candidates:
         domain = normalize_domain(item.domain)
-        if not is_usable_shop_domain(domain) or is_junk_store_domain(domain):
+        if not is_custom_shop_domain(domain):
             junk += 1
             continue
         item.domain = domain

@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, field
 
 from utils.http import fetch_public
-from utils.normalization import website_url
+from utils.normalization import is_junk_store_domain, is_usable_shop_domain, normalize_domain, website_url
 
 PASSWORD_MARKERS = (
     "password-page",
@@ -37,6 +37,10 @@ PIXEL_MARKERS = (
     ("Klaviyo", ("klaviyo.com", "_learnq")),
 )
 
+CANONICAL_TAG = re.compile(r"<link[^>]+rel=[\"']canonical[\"'][^>]*>", re.I)
+OG_URL_TAG = re.compile(r"<meta[^>]+property=[\"']og:url[\"'][^>]*>", re.I)
+HREF_ATTR = re.compile(r"href=[\"']([^\"']+)", re.I)
+CONTENT_ATTR = re.compile(r"content=[\"']([^\"']+)", re.I)
 PRODUCT_NAME = re.compile(
     r'"@type"\s*:\s*"Product"[\s\S]{0,500}?"name"\s*:\s*"([^"\\]{2,120})"',
     re.I,
@@ -81,6 +85,54 @@ class StorefrontProfile:
         if self.pixels:
             parts.append("Public pixels: " + ", ".join(self.pixels) + ".")
         return " ".join(parts)
+
+
+def published_custom_domain(domain: str, homepage_html: str) -> str:
+    """
+    Return the shop's own public domain when it is not a myshopify.com name.
+
+    The domain is taken from the store's meta.json, canonical URL, or og:url.
+    The myshopify.com slug is never turned into a guessed .com name.
+    """
+    hosts = [_domain_from_meta(domain)]
+    hosts.extend(_domains_from_html(homepage_html))
+    for host in hosts:
+        if not host or host.endswith(".myshopify.com") or host.endswith(".shopify.com"):
+            continue
+        if is_usable_shop_domain(host) and not is_junk_store_domain(host):
+            return host
+    return ""
+
+
+def _domain_from_meta(domain: str) -> str:
+    result = fetch_public(
+        website_url(domain) + "/meta.json",
+        accept="application/json",
+        max_bytes=100_000,
+        timeout=12,
+    )
+    if not result.ok:
+        return ""
+    try:
+        payload = json.loads(result.text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return normalize_domain(str(payload.get("domain") or payload.get("url") or ""))
+
+
+def _domains_from_html(html: str) -> list[str]:
+    hosts: list[str] = []
+    for tag in CANONICAL_TAG.findall(html or ""):
+        match = HREF_ATTR.search(tag)
+        if match:
+            hosts.append(normalize_domain(match.group(1)))
+    for tag in OG_URL_TAG.findall(html or ""):
+        match = CONTENT_ATTR.search(tag)
+        if match:
+            hosts.append(normalize_domain(match.group(1)))
+    return hosts
 
 
 def inspect_storefront(domain: str, homepage_html: str) -> StorefrontProfile:

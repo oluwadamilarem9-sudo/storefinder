@@ -30,6 +30,7 @@ from config import (
 )
 from utils.http import fetch_public
 from utils.normalization import (
+    is_custom_shop_domain,
     is_junk_store_domain,
     is_usable_shop_domain,
     normalize_domain,
@@ -209,10 +210,7 @@ class UrlscanRecentSource(PublicDiscoverySource):
     name = "urlscan_recent"
     tier = "primary"
     queries = (
-        "page.domain:myshopify.com AND page.status:200",
-        "page.domain:myshopify.com",
-        "domain:myshopify.com",
-        "page.server:Shopify",
+        "task.domain:myshopify.com -page.domain:myshopify.com AND page.status:200",
     )
 
     def __init__(self) -> None:
@@ -300,13 +298,9 @@ class UrlscanRecentSource(PublicDiscoverySource):
         for row in payload.get("results", []):
             page = row.get("page") or {}
             task = row.get("task") or {}
-            host = normalize_domain(page.get("domain") or task.get("domain") or "")
-            if not is_usable_shop_domain(host) or is_junk_store_domain(host) or host in seen or host in skipped:
+            host = normalize_domain(page.get("domain") or "")
+            if host in seen or host in skipped or not is_custom_shop_domain(host):
                 continue
-            if not host.endswith(".myshopify.com"):
-                server = str(page.get("server") or "").lower()
-                if "shopify" not in server:
-                    continue
             stamp = parse_loose_date(str(task.get("time") or row.get("indexedAt") or ""))
             scan_url = row.get("result") or ""
             source_url = scan_url if str(scan_url).startswith("http") else f"https://urlscan.io/domain/{host}"

@@ -43,7 +43,7 @@ def discover_candidates(
         if on_log:
             on_log(message)
 
-    log("Searching public sources for Shopify hostnames...")
+    log("Searching public sources for shops on their own domain...")
     discovered.extend(_run_sources(active_sources(), cap, log, exclude))
 
     unused = _unused_count(discovered, exclude)

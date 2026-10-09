@@ -155,6 +155,16 @@ def absolute_url(base_url: str, href: str) -> str:
     return urljoin(base_url if base_url.endswith("/") else base_url + "/", href)
 
 
+def is_custom_shop_domain(domain: str) -> bool:
+    """True for a shop's own hostname. A myshopify.com name is not a result."""
+    host = normalize_domain(domain)
+    if not is_usable_shop_domain(host) or is_junk_store_domain(host):
+        return False
+    if host.endswith(".myshopify.com") or host.endswith(".shopify.com"):
+        return False
+    return True
+
+
 def is_usable_shop_domain(domain: str) -> bool:
     """Drop Shopify platform hosts and empty values."""
     host = normalize_domain(domain)
