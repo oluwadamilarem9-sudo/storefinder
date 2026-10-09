@@ -38,9 +38,6 @@ def _load_app_config():
 _config = _load_app_config()
 ENABLE_SECONDARY_SOURCES = _config.ENABLE_SECONDARY_SOURCES
 MAX_DOMAINS_PER_CYCLE = _config.MAX_DOMAINS_PER_CYCLE
-MIN_FRESHNESS_LEVEL = _config.MIN_FRESHNESS_LEVEL
-NEW_STORE_DAYS = _config.NEW_STORE_DAYS
-NEW_STORE_HIGH_DAYS = _config.NEW_STORE_HIGH_DAYS
 OUTPUT_FILE = _config.OUTPUT_FILE
 REJECTED_FILE = _config.REJECTED_FILE
 TARGET_COUNTRIES = _config.TARGET_COUNTRIES
@@ -278,7 +275,7 @@ def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, 
 st.title("Shopify Public Lead Finder")
 st.caption(
     "Automatically discovers candidate Shopify websites from public sources "
-    "and keeps only new stores with a public email and a published country. "
+    "and keeps operating Shopify shops that show a public email, a published country, and real products. "
     "You do not paste store URLs."
 )
 
@@ -390,21 +387,10 @@ with st.sidebar:
         step=5,
         help="The run visits this many websites. It does not stop when the first lead is saved.",
     )
-    min_freshness = st.selectbox(
-        "How new the store must be",
-        options=["HIGH", "MEDIUM"],
-        index=0 if MIN_FRESHNESS_LEVEL == "HIGH" else 1,
-        format_func=lambda level: (
-            f"HIGH — public proof from the last {NEW_STORE_HIGH_DAYS} days"
-            if level == "HIGH"
-            else f"MEDIUM — public proof from the last {NEW_STORE_DAYS} days"
-        ),
-        help="A store is saved only when a domain registration or the earliest certificate proves it appeared in this window. Found today is not launched today.",
-    )
     enable_secondary = st.checkbox(
         "Include secondary sources (Hacker News, Wayback, Common Crawl)",
         value=bool(ENABLE_SECONDARY_SOURCES),
-        help="Off by default. Secondary sources usually find existing stores, not new launches.",
+        help="Off by default. These indexes list older mentions. A shop from them still needs a public email, a country, and products.",
     )
     all_countries = st.checkbox(
         "All countries",
@@ -422,14 +408,13 @@ with st.sidebar:
             help="A store is kept only when its public page publishes one of these countries.",
         )
     st.caption(
-        "A lead is a new store with a public business email and a country published on the store. "
+        "A lead is an operating shop with a public business email, a country published on the store, and real products. "
         "Country is never guessed from Shopify hosting IPs or a myshopify.com name."
     )
     st.divider()
     run_clicked = st.button("Run discovery cycle", type="primary", width="stretch")
     st.caption(
-        "Each checked store is tested against public domain, certificate, and archive dates. "
-        "Fast mode only shortens the contact-page visits."
+        "Each checked store is opened in public. Fast mode only shortens the contact-page visits."
     )
 
 storage = _project_storage()
@@ -453,8 +438,8 @@ email_count = (
 metric_one, metric_two, metric_three, metric_four, metric_five, metric_six = st.columns(6)
 metric_one.metric("Last cycle candidates", int(stats.get("candidates") or 0))
 metric_two.metric("Last cycle Shopify", int(stats.get("shopify") or 0))
-metric_three.metric("High freshness", int(stats.get("high") or 0))
-metric_four.metric("Medium freshness", int(stats.get("medium") or 0))
+metric_three.metric("Operating shops", int(stats.get("high") or 0))
+metric_four.metric("No public products", int(stats.get("low") or 0))
 this_run_saved = len(st.session_state.this_run_lead_domains)
 metric_five.metric("This run qualifying", this_run_saved)
 metric_six.metric("This run rejected", len(st.session_state.this_run_rejected_domains))
@@ -505,7 +490,6 @@ if run_clicked:
         result = run_cycle(
             on_log=on_log,
             max_domains=max_domains,
-            min_freshness=min_freshness,
             enable_secondary=enable_secondary,
             target_countries=[] if all_countries else selected_country_codes,
             keep_unknown_country=keep_unknown_country,
@@ -543,14 +527,14 @@ if run_clicked:
     if complete:
         st.session_state.flash_kind = "success"
         st.session_state.flash = (
-            f"Discovery found {saved} new store(s) with a public email and a published country. "
+            f"Discovery found {saved} operating shop(s) with a public email, a published country, and public products. "
             f"{count_line} Open the Qualifying leads tab."
         )
     elif result.get("checked"):
         st.session_state.flash_kind = "warning"
         st.session_state.flash = (
-            "Discovery did not complete. No new store had a public email, a matching "
-            "published country, and public proof it appeared recently. "
+            "Discovery did not complete. No shop had a public email, a matching "
+            "published country, and public products. "
             f"{count_line} Open Rejected candidates and the Activity log."
         )
     else:
@@ -582,7 +566,7 @@ leads_tab, rejected_tab = st.tabs(
 with leads_tab:
     st.subheader("Qualifying leads from this run")
     st.write(
-        "Only new stores from this project with a public email and a published country are shown. "
+        "Only operating shops from this run with a public email, a published country, and public products are shown. "
         "Another account's cycles are not included. "
         "Emails are copied from public pages only."
     )
@@ -601,8 +585,8 @@ with leads_tab:
     if view.empty:
         if show_earlier_leads:
             st.info(
-                "No HIGH/MEDIUM leads are saved yet. "
-                "A run is complete only after a qualifying store is found."
+                "No qualifying shops are saved yet. "
+                "A run is complete only after a shop with a public email, a country, and products is found."
             )
         else:
             st.info(
@@ -747,10 +731,11 @@ st.markdown(
     """
 **How this works**
 
-Public sources → Shopify check → new-store proof → public email and country
+Public sources → Shopify check → public products, email, and country
 → save for this project only.
 
-A store is new only when its domain registration or earliest certificate is inside the selected window, and no older archive or certificate contradicts that. A page found today is not a launch date.
+A lead is a shop whose public pages show a business email, a country, and real products.
+A password wall or an empty catalog is rejected. Sales and revenue are not estimated.
 Country is copied from the store's own public pages.
 """
 )

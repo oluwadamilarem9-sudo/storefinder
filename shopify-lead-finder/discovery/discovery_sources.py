@@ -561,7 +561,111 @@ class HackerNewsPublicApiSource(PublicDiscoverySource):
         return found
 
 
+class PublicShopSearchSource(PublicDiscoverySource):
+    """
+    Primary source: public web search pages that name a Shopify shop.
+
+    These queries look for shops that mention contact details or a cart,
+    which is a better starting list than a hostname that only renewed a
+    certificate. A search hit is still checked against the storefront.
+    """
+
+    name = "public_shop_search"
+    tier = "primary"
+    queries = (
+        '"myshopify.com" "contact us"',
+        '"myshopify.com" "add to cart"',
+        '"myshopify.com" "shipping policy"',
+    )
+
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
+        found: list[DiscoveredCandidate] = []
+        seen: set[str] = set()
+        blocked = {normalize_domain(item) for item in (exclude or set()) if item}
+        for query in self.queries:
+            if len(found) >= limit:
+                break
+            url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+            result = fetch_public(
+                url,
+                accept="text/html",
+                max_bytes=MAX_SOURCE_BYTES,
+                timeout=SOURCE_TIMEOUT,
+                allow_cross_domain_redirect=True,
+                check_robots=False,
+            )
+            if not result.ok:
+                print(f"  Skipping {self.name} query ({result.error}).")
+                continue
+            _collect_shop_domains(
+                result.text,
+                source=self.name,
+                source_url=url,
+                evidence=(
+                    "Named on a public web search page for Shopify shops. "
+                    "A search listing is not a launch date or a sales figure."
+                ),
+                kind="public_directory",
+                limit=limit,
+                blocked=blocked,
+                found=found,
+                seen=seen,
+            )
+        return found
+
+
+class PublicAdLibrarySource(PublicDiscoverySource):
+    """
+    Primary source: the public Meta Ad Library page for myshopify.com.
+
+    If the page is a login wall or contains no shop hostnames, this
+    source returns nothing and the run moves on.
+    """
+
+    name = "public_ad_library"
+    tier = "primary"
+    page_url = (
+        "https://www.facebook.com/ads/library/"
+        "?active_status=active&ad_type=all&country=ALL&q=myshopify.com"
+        "&search_type=keyword_unordered&media_type=all"
+    )
+
+    def discover(self, limit: int = MAX_CANDIDATES_PER_SOURCE, exclude: set[str] | None = None) -> list[DiscoveredCandidate]:
+        result = fetch_public(
+            self.page_url,
+            accept="text/html",
+            max_bytes=MAX_SOURCE_BYTES,
+            timeout=SOURCE_TIMEOUT,
+            allow_cross_domain_redirect=True,
+            check_robots=False,
+        )
+        if not result.ok:
+            print(f"  Skipping {self.name} ({result.error}).")
+            return []
+        found: list[DiscoveredCandidate] = []
+        blocked = {normalize_domain(item) for item in (exclude or set()) if item}
+        _collect_shop_domains(
+            result.text,
+            source=self.name,
+            source_url=self.page_url,
+            evidence=(
+                "Named on the public Meta Ad Library page. "
+                "An ad listing is not a sales or revenue figure."
+            ),
+            kind="public_ads",
+            limit=limit,
+            blocked=blocked,
+            found=found,
+            seen=set(),
+        )
+        if not found:
+            print(f"  {self.name} did not list any shop hostnames.")
+        return found
+
+
 PRIMARY_SOURCES: list[PublicDiscoverySource] = [
+    PublicShopSearchSource(),
+    PublicAdLibrarySource(),
     UrlscanRecentSource(),
     CrtShRecentCertificateSource(),
     CertSpotterRecentSource(),
@@ -588,6 +692,36 @@ def fallback_sources() -> list[PublicDiscoverySource]:
         CommonCrawlSource(),
         HackerNewsPublicApiSource(),
     ]
+
+
+def _collect_shop_domains(
+    text: str,
+    *,
+    source: str,
+    source_url: str,
+    evidence: str,
+    kind: str,
+    limit: int,
+    blocked: set[str],
+    found: list[DiscoveredCandidate],
+    seen: set[str],
+) -> None:
+    for domain in domains_from_text(text):
+        if domain in seen or domain in blocked:
+            continue
+        seen.add(domain)
+        found.append(
+            DiscoveredCandidate(
+                domain=domain,
+                source=source,
+                source_url=source_url,
+                discovered_at=now_iso(),
+                evidence=evidence,
+                extra={"source_kind": kind},
+            )
+        )
+        if len(found) >= limit:
+            return
 
 
 def domains_from_text(text: str) -> list[str]:

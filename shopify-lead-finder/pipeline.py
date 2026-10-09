@@ -21,9 +21,9 @@ from database.database import (
     upsert_rejected,
 )
 from detection.shopify_detector import detect_shopify
+from detection.storefront_profile import inspect_storefront, is_password_page
 from discovery.candidate_manager import prepare_candidates
 from discovery.domain_discovery import discover_candidates
-from discovery.freshness import meets_minimum, prove_new_store
 from utils.countries import country_allows, country_label, normalize_country
 from utils.http import fetch_public
 from utils.normalization import is_junk_store_domain, is_usable_shop_domain, normalize_domain, now_iso, website_url
@@ -91,12 +91,11 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v11")
+        log("Discovery engine v12")
         log(
-            "A lead is a new store only: public proof it appeared within "
-            f"{config.NEW_STORE_DAYS} days, plus a public email and a published country."
+            "A lead is an operating Shopify shop with a public business email, "
+            "a published country, and real products in the public catalog."
         )
-        log("Found today is not launched today.")
         log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
             log("This run uses only the signed-in project's history.")
@@ -222,6 +221,21 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         return
 
     stats["shopify"] += 1
+    if is_password_page(homepage.text):
+        _reject(
+            connection,
+            stats,
+            domain,
+            final_domain,
+            candidate,
+            contacts={},
+            reason="password_page",
+            evidence="The public page is a password wall or an opening-soon page.",
+            log=log,
+            status="rejected (password page)",
+        )
+        return
+
     contacts = find_public_contacts(final_domain, homepage.text)
     published_country = contacts.get("country") or ""
     country_code = normalize_country(published_country)
@@ -230,6 +244,104 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         + (f" ({country_code})" if country_code else "")
     )
 
+    allowed, country_reason = country_allows(
+        published_country,
+        config.TARGET_COUNTRIES,
+        config.KEEP_UNKNOWN_COUNTRY,
+    )
+    if not allowed:
+        if country_reason == "country_unknown":
+            status = "rejected (no published country)"
+        else:
+            status = "rejected (country outside selected list)"
+        _reject(
+            connection,
+            stats,
+            domain,
+            final_domain,
+            candidate,
+            contacts=contacts,
+            reason=country_reason,
+            evidence=(
+                "Public country "
+                f"{published_country or 'was not published'} "
+                "and did not match the selected countries."
+            ),
+            log=log,
+            status=status,
+        )
+        return
+
+    if not (contacts.get("public_email") or "").strip():
+        _reject(
+            connection,
+            stats,
+            domain,
+            final_domain,
+            candidate,
+            contacts=contacts,
+            reason="no_public_email",
+            evidence="No public business email was displayed.",
+            log=log,
+            status="rejected (no public business email)",
+        )
+        return
+
+    profile = inspect_storefront(final_domain, homepage.text)
+    log(f"  Catalog: {profile.evidence()}")
+    if profile.password_page:
+        _reject(
+            connection,
+            stats,
+            domain,
+            final_domain,
+            candidate,
+            contacts=contacts,
+            reason="password_page",
+            evidence=profile.evidence(),
+            log=log,
+            status="rejected (password page)",
+        )
+        return
+    if not profile.product_names:
+        stats["low"] += 1
+        _reject(
+            connection,
+            stats,
+            domain,
+            final_domain,
+            candidate,
+            contacts=contacts,
+            reason="no_public_products",
+            evidence=profile.evidence(),
+            log=log,
+            status="rejected (no public products)",
+        )
+        return
+
+    record = {
+        **contacts,
+        "domain": final_domain,
+        "shopify_status": "SHOPIFY",
+        "discovery_source": candidate.source,
+        "source_url": candidate.source_url,
+        "discovered_at": candidate.discovered_at or now_iso(),
+        "freshness_score": 80,
+        "freshness_level": "HIGH",
+        "freshness_evidence": profile.evidence(),
+    }
+    stats["high"] += 1
+    stats["emails"] += 1
+    log(f"  Email: {record['public_email']}")
+    upsert_lead(connection, record)
+    stats["this_run_lead_domains"].append(final_domain)
+    log("  Status: saved to leads.csv")
+
+    if final_domain != domain:
+        mark_processed(connection, domain, "SHOPIFY", candidate.source)
+
+
+def _reject(connection, stats, domain, final_domain, candidate, contacts, reason, evidence, log, status) -> None:
     record = {
         **contacts,
         "domain": final_domain,
@@ -238,76 +350,13 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         "source_url": candidate.source_url,
         "discovered_at": candidate.discovered_at or now_iso(),
         "freshness_score": 0,
-        "freshness_level": "UNKNOWN",
-        "freshness_evidence": "",
+        "freshness_level": "LOW",
+        "freshness_evidence": evidence,
+        "reject_reason": reason,
     }
-
-    allowed, country_reason = country_allows(
-        published_country,
-        config.TARGET_COUNTRIES,
-        config.KEEP_UNKNOWN_COUNTRY,
-    )
-    if not allowed:
-        record["reject_reason"] = country_reason
-        record["freshness_evidence"] = (
-            "Public country "
-            f"{published_country or 'was not published'} "
-            "and did not match the selected countries."
-        )
-        upsert_rejected(connection, record)
-        stats["this_run_rejected_domains"].append(final_domain)
-        if country_reason == "country_unknown":
-            log("  Status: rejected (no published country)")
-        else:
-            log("  Status: rejected (country outside selected list)")
-        if final_domain != domain:
-            mark_processed(connection, domain, "SHOPIFY", candidate.source)
-        return
-
-    if not (record.get("public_email") or "").strip():
-        record["reject_reason"] = "no_public_email"
-        record["freshness_evidence"] = "No public business email was displayed."
-        upsert_rejected(connection, record)
-        stats["this_run_rejected_domains"].append(final_domain)
-        log("  Status: rejected (no public business email)")
-        if final_domain != domain:
-            mark_processed(connection, domain, "SHOPIFY", candidate.source)
-        return
-
-    newness = prove_new_store(final_domain, homepage.text)
-    record["freshness_score"] = newness.freshness_score
-    record["freshness_level"] = newness.freshness_level
-    record["freshness_evidence"] = newness.evidence
-    log(f"  New store check: {newness.freshness_level} ({newness.evidence})")
-
-    if not newness.is_new:
-        record["reject_reason"] = "not_a_new_store"
-        upsert_rejected(connection, record)
-        stats["this_run_rejected_domains"].append(final_domain)
-        log("  Status: rejected (not a new store)")
-        if final_domain != domain:
-            mark_processed(connection, domain, "SHOPIFY", candidate.source)
-        return
-
-    if not meets_minimum(newness.freshness_level, config.MIN_FRESHNESS_LEVEL):
-        record["reject_reason"] = "below_freshness_threshold"
-        upsert_rejected(connection, record)
-        stats["this_run_rejected_domains"].append(final_domain)
-        log("  Status: rejected (older than the selected new-store window)")
-        if final_domain != domain:
-            mark_processed(connection, domain, "SHOPIFY", candidate.source)
-        return
-
-    if newness.freshness_level == "HIGH":
-        stats["high"] += 1
-    else:
-        stats["medium"] += 1
-    stats["emails"] += 1
-    log(f"  Email: {record['public_email']}")
-    upsert_lead(connection, record)
-    stats["this_run_lead_domains"].append(final_domain)
-    log("  Status: saved to leads.csv")
-
+    upsert_rejected(connection, record)
+    stats["this_run_rejected_domains"].append(final_domain)
+    log(f"  Status: {status}")
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
 
@@ -328,20 +377,19 @@ def _log_summary(connection, stats: dict, log: LogFn) -> None:
             "Public sources ran out before the requested number of websites was checked."
         )
     log(f"Shopify stores: {stats['shopify']}")
-    log(f"High freshness: {stats['high']}")
-    log(f"Medium freshness: {stats['medium']}")
-    log(f"Low freshness: {stats['low']}")
+    log(f"Operating shops saved: {stats['high']}")
+    log(f"Shops with no public products: {stats['low']}")
     log(f"Public business emails: {stats['emails']}")
     log(f"Duplicates / already seen: {stats['duplicates']}")
     log(f"Excluded from earlier runs: {stats['skipped_seen']}")
 
     if saved > 0:
-        log(f"Discovery found {saved} new store(s) with a public email and a published country.")
+        log(f"Discovery found {saved} operating shop(s) with a public email, a published country, and public products.")
         this_run = stats.get("this_run_lead_domains") or []
         for index, domain in enumerate(this_run, start=1):
             log(f"{index}. https://{domain}")
     else:
-        log("Discovery did not complete: no new store had a public email, a matching country, and public proof it appeared recently.")
+        log("Discovery did not complete: no shop had a public email, a matching country, and public products.")
 
     log(f"Qualifying leads: {config.OUTPUT_FILE}")
     log(f"Rejected candidates: {config.REJECTED_FILE}")
