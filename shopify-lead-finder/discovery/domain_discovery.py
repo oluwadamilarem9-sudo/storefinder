@@ -29,6 +29,7 @@ def discover_candidates(
     on_log: LogFn | None = None,
     exclude_domains: set[str] | None = None,
     min_unused: int = 1,
+    sources: list | None = None,
 ) -> list[DiscoveredCandidate]:
     """
     Ask public sources for candidate domains until unused websites
@@ -44,7 +45,7 @@ def discover_candidates(
             on_log(message)
 
     log("Searching public sources for shops on their own domain...")
-    discovered.extend(_run_sources(active_sources(), cap, log, exclude))
+    discovered.extend(_run_sources(sources or active_sources(), cap, log, exclude))
 
     unused = _unused_count(discovered, exclude)
     if unused == 0:

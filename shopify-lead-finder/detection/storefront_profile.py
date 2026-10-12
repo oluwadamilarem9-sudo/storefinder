@@ -94,8 +94,13 @@ def published_custom_domain(domain: str, homepage_html: str) -> str:
     The domain is taken from the store's meta.json, canonical URL, or og:url.
     The myshopify.com slug is never turned into a guessed .com name.
     """
-    hosts = [_domain_from_meta(domain)]
-    hosts.extend(_domains_from_html(homepage_html))
+    hosts = _domains_from_html(homepage_html)
+    if not _first_custom_host(hosts):
+        hosts.append(_domain_from_meta(domain))
+    return _first_custom_host(hosts)
+
+
+def _first_custom_host(hosts: list[str]) -> str:
     for host in hosts:
         if not host or host.endswith(".myshopify.com") or host.endswith(".shopify.com"):
             continue
@@ -109,7 +114,7 @@ def _domain_from_meta(domain: str) -> str:
         website_url(domain) + "/meta.json",
         accept="application/json",
         max_bytes=100_000,
-        timeout=12,
+        timeout=5,
     )
     if not result.ok:
         return ""
@@ -164,7 +169,7 @@ def _products_from_catalog(domain: str) -> list[str]:
         website_url(domain) + "/products.json?limit=50",
         accept="application/json",
         max_bytes=400_000,
-        timeout=12,
+        timeout=6,
     )
     if not result.ok:
         return []

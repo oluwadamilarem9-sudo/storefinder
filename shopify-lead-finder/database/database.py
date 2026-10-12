@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 
@@ -16,6 +17,17 @@ from config import DATABASE_FILE, MIN_FRESHNESS_LEVEL, OUTPUT_FILE, REJECTED_FIL
 from utils.normalization import now_iso
 
 _LEVEL_RANK = {"UNKNOWN": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+_DB_LOCK = Lock()
+
+
+def _db_locked(func):
+    """Keep SQLite calls one at a time while website downloads run together."""
+
+    def wrapped(*args, **kwargs):
+        with _DB_LOCK:
+            return func(*args, **kwargs)
+
+    return wrapped
 
 LEAD_COLUMNS = [
     "store_name",
@@ -43,8 +55,9 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     """Open the local database and create tables if needed."""
     db_path = path or DATABASE_FILE
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path)
+    connection = sqlite3.connect(db_path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
     _create_tables(connection)
     _migrate_leads(connection)
     _rehome_unscored_leads(connection)
@@ -199,6 +212,7 @@ def watched_password_domains(connection: sqlite3.Connection) -> list[str]:
     return [str(row["domain"]) for row in rows if row["domain"]]
 
 
+@_db_locked
 def clear_password_watch(connection: sqlite3.Connection, domain: str) -> None:
     connection.execute(
         "DELETE FROM rejected_candidates WHERE domain = ? AND reject_reason = 'password_page'",
@@ -243,6 +257,7 @@ def is_new_domain(connection: sqlite3.Connection, domain: str) -> bool:
     return row is None
 
 
+@_db_locked
 def mark_processed(
     connection: sqlite3.Connection,
     domain: str,
@@ -269,6 +284,7 @@ def mark_processed(
     connection.commit()
 
 
+@_db_locked
 def upsert_lead(connection: sqlite3.Connection, lead: dict) -> None:
     """Insert or update one Shopify store that met the freshness threshold."""
     timestamp = now_iso()
@@ -336,6 +352,7 @@ def upsert_lead(connection: sqlite3.Connection, lead: dict) -> None:
     connection.commit()
 
 
+@_db_locked
 def upsert_rejected(connection: sqlite3.Connection, row: dict) -> None:
     timestamp = now_iso()
     existing = connection.execute(

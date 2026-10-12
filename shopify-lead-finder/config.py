@@ -6,16 +6,24 @@ Change these values in this file. There are no paid APIs or cloud keys.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-# Pause between HTTP requests so we do not hammer websites.
-REQUEST_DELAY = 0.5
+# Pause between requests to the same website. Other websites are not held back.
+REQUEST_DELAY = 0.2
 
 # Give slow websites time to answer, then move on.
-REQUEST_TIMEOUT = 8
+REQUEST_TIMEOUT = 5
+
+# How many different websites to open at the same time during one cycle.
+CHECK_WORKERS = 6
+
+# How many discovery cycles this machine runs at the same time.
+# Each extra computer that runs worker.py adds this many more cycles.
+WORKER_SLOTS = int(os.environ.get("WORKER_SLOTS") or "8")
 
 # How many candidate websites to visit in one cycle.
 # The web UI allows 5 to 10,000. Public sources may return fewer.

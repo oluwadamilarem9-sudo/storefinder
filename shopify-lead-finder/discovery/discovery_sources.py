@@ -673,10 +673,21 @@ SECONDARY_SOURCES: list[PublicDiscoverySource] = [
 ]
 
 
-def active_sources() -> list[PublicDiscoverySource]:
-    sources = list(PRIMARY_SOURCES)
-    if ENABLE_SECONDARY_SOURCES:
-        sources.extend(SECONDARY_SOURCES)
+def active_sources(enable_secondary: bool | None = None) -> list[PublicDiscoverySource]:
+    """New source objects for one cycle, so two cycles do not share a search cursor."""
+    import config as app_config
+
+    enabled = app_config.ENABLE_SECONDARY_SOURCES if enable_secondary is None else enable_secondary
+    sources: list[PublicDiscoverySource] = [
+        UrlscanRecentSource(),
+        CommonCrawlSource(),
+        PublicShopSearchSource(),
+        PublicAdLibrarySource(),
+        CrtShRecentCertificateSource(),
+        CertSpotterRecentSource(),
+    ]
+    if enabled:
+        sources.extend([WaybackMachineSource(), HackerNewsPublicApiSource()])
     return sources
 
 

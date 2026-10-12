@@ -7,8 +7,10 @@ contact finding. It only runs those existing modules in order.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
 from contact.public_contact_finder import find_public_contacts
@@ -26,13 +28,24 @@ from database.database import (
 from detection.shopify_detector import detect_shopify
 from detection.storefront_profile import inspect_storefront, is_password_page, published_custom_domain
 from discovery.candidate_manager import prepare_candidates
-from discovery.discovery_sources import DiscoveredCandidate
+from discovery.discovery_sources import DiscoveredCandidate, active_sources
 from discovery.domain_discovery import discover_candidates
 from utils.countries import country_allows, country_label, normalize_country
 from utils.http import fetch_public
 from utils.normalization import is_junk_store_domain, is_usable_shop_domain, normalize_domain, now_iso, website_url
 
 LogFn = Callable[[str], None]
+_STATS_LOCK = threading.Lock()
+
+
+def _add_stat(stats: dict, key: str, amount: int = 1) -> None:
+    with _STATS_LOCK:
+        stats[key] = int(stats.get(key) or 0) + amount
+
+
+def _append_stat(stats: dict, key: str, value: str) -> None:
+    with _STATS_LOCK:
+        stats.setdefault(key, []).append(value)
 
 
 def run_cycle(
@@ -52,23 +65,12 @@ def run_cycle(
 
     Optional overrides apply only for this run and are restored after.
     """
-    previous = (
-        config.MAX_DOMAINS_PER_CYCLE,
-        config.MIN_FRESHNESS_LEVEL,
-        config.ENABLE_SECONDARY_SOURCES,
-        list(config.TARGET_COUNTRIES),
-        config.KEEP_UNKNOWN_COUNTRY,
-    )
-    if max_domains is not None:
-        config.MAX_DOMAINS_PER_CYCLE = max_domains
-    if min_freshness is not None:
-        config.MIN_FRESHNESS_LEVEL = min_freshness
-    if enable_secondary is not None:
-        config.ENABLE_SECONDARY_SOURCES = enable_secondary
+    requested_domains = config.MAX_DOMAINS_PER_CYCLE if max_domains is None else max_domains
+    countries = list(config.TARGET_COUNTRIES)
     if target_countries is not None:
-        config.TARGET_COUNTRIES = [item.upper() for item in target_countries if item]
-    if keep_unknown_country is not None:
-        config.KEEP_UNKNOWN_COUNTRY = keep_unknown_country
+        countries = [item.upper() for item in target_countries if item]
+    keep_unknown = config.KEEP_UNKNOWN_COUNTRY if keep_unknown_country is None else keep_unknown_country
+    secondary = config.ENABLE_SECONDARY_SOURCES if enable_secondary is None else enable_secondary
 
     def log(message: str) -> None:
         print(message)
@@ -95,20 +97,21 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v16")
+        log("Discovery engine v17")
         log("This run checks each shop on its own domain. A myshopify.com name is not checked and is not saved.")
+        log("Several websites are checked at the same time.")
         log("A password page is checked again on a later run. It is not published until the shop opens.")
         log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
             log("This run uses only the signed-in project's history.")
         log("Finished shops from earlier runs are excluded and will not be checked again.")
         log("Shops still behind a password page are watched and checked again.")
-        if config.TARGET_COUNTRIES:
-            labels = ", ".join(country_label(code) for code in config.TARGET_COUNTRIES)
+        if countries:
+            labels = ", ".join(country_label(code) for code in countries)
             log(f"Country filter: {labels}.")
             log(
                 "Unknown published country: "
-                + ("keep" if config.KEEP_UNKNOWN_COUNTRY else "reject")
+                + ("keep" if keep_unknown else "reject")
                 + ". Country comes from public store pages only."
             )
         else:
@@ -128,7 +131,7 @@ def run_cycle(
             log(
                 f"Skipping {len(seen_this_run)} store(s) already used in earlier runs."
             )
-        max_domains = config.MAX_DOMAINS_PER_CYCLE
+        max_domains = requested_domains
         stats["requested"] = max_domains
         log(f"Websites to check this run: {max_domains}.")
         if myshopify_watches:
@@ -138,42 +141,69 @@ def run_cycle(
             )
         rate_streak = 0
 
-        def check_one(candidate) -> bool:
+        def check_many(candidates) -> None:
             nonlocal rate_streak
-            if stats["checked"] >= max_domains or stats.get("slowed_down"):
-                return False
-            seen_this_run.add(candidate.domain)
-            stats["checked"] += 1
-            try:
-                counted = _process_candidate(connection, candidate, stats["checked"], max_domains, stats, log)
-            except Exception as exc:
-                log(f"  Error on {candidate.domain}: {exc}")
-                mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
-                counted = True
-            if counted:
-                rate_streak = 0
-                return stats["checked"] < max_domains
-            stats["checked"] -= 1
-            rate_streak += 1
-            if rate_streak >= 8:
-                stats["slowed_down"] = True
-                log("Storefronts asked us to slow down. Remaining shops stay for a later run.")
-                return False
-            return True
+            pending = []
+            for candidate in candidates:
+                if stats["checked"] >= max_domains or stats.get("slowed_down"):
+                    break
+                seen_this_run.add(candidate.domain)
+                stats["checked"] += 1
+                pending.append((candidate, stats["checked"]))
+            if not pending:
+                return
+
+            def quiet(candidate, index: int):
+                lines: list[str] = []
+                try:
+                    counted = _process_candidate(
+                        connection,
+                        candidate,
+                        index,
+                        max_domains,
+                        stats,
+                        lines.append,
+                        countries,
+                        keep_unknown,
+                    )
+                except Exception as exc:
+                    lines.append(f"  Error on {candidate.domain}: {exc}")
+                    mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
+                    counted = True
+                return counted, lines
+
+            workers = min(config.CHECK_WORKERS, len(pending))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(quiet, candidate, index) for candidate, index in pending]
+                for future in as_completed(futures):
+                    counted, lines = future.result()
+                    for line in lines:
+                        log(line)
+                    if counted:
+                        rate_streak = 0
+                    else:
+                        stats["checked"] -= 1
+                        rate_streak += 1
+                        if rate_streak >= 8:
+                            stats["slowed_down"] = True
+                            log("Storefronts asked us to slow down. Remaining shops stay for a later run.")
 
         if watching:
             log(f"Rechecking {len(watching)} shop(s) still behind a password page.")
-            for domain in watching:
-                candidate = DiscoveredCandidate(
-                    domain=domain,
-                    source="password_watch",
-                    source_url="",
-                    discovered_at=now_iso(),
-                    evidence="Checked again after an earlier password page.",
-                )
-                if not check_one(candidate):
-                    break
+            check_many(
+                [
+                    DiscoveredCandidate(
+                        domain=domain,
+                        source="password_watch",
+                        source_url="",
+                        discovered_at=now_iso(),
+                        evidence="Checked again after an earlier password page.",
+                    )
+                    for domain in watching
+                ]
+            )
 
+        cycle_sources = active_sources(enable_secondary=secondary)
         while stats["checked"] < max_domains and not stats.get("slowed_down"):
             remaining = max_domains - stats["checked"]
             raw_candidates = discover_candidates(
@@ -181,6 +211,7 @@ def run_cycle(
                 on_log=log,
                 exclude_domains=seen_this_run,
                 min_unused=remaining,
+                sources=cycle_sources,
             )
             stats["candidates"] += len(raw_candidates)
             if not raw_candidates:
@@ -201,9 +232,10 @@ def run_cycle(
                 )
                 break
 
-            for candidate in to_check:
-                if not check_one(candidate):
+            for start in range(0, len(to_check), config.CHECK_WORKERS):
+                if stats.get("slowed_down") or stats["checked"] >= max_domains:
                     break
+                check_many(to_check[start : start + config.CHECK_WORKERS])
 
         stats["count_complete"] = stats["checked"] >= max_domains
         stats["complete"] = len(stats["this_run_lead_domains"]) > 0
@@ -213,24 +245,26 @@ def run_cycle(
         return stats
     finally:
         connection.close()
-        (
-            config.MAX_DOMAINS_PER_CYCLE,
-            config.MIN_FRESHNESS_LEVEL,
-            config.ENABLE_SECONDARY_SOURCES,
-            config.TARGET_COUNTRIES,
-            config.KEEP_UNKNOWN_COUNTRY,
-        ) = previous
 
 
 def _fetch_storefront(domain: str):
     homepage = fetch_public(website_url(domain), allow_cross_domain_redirect=True)
     if homepage.error == "429":
-        time.sleep(8)
+        time.sleep(2)
         homepage = fetch_public(website_url(domain), allow_cross_domain_redirect=True)
     return homepage
 
 
-def _process_candidate(connection, candidate, index: int, total: int, stats: dict, log: LogFn) -> bool:
+def _process_candidate(
+    connection,
+    candidate,
+    index: int,
+    total: int,
+    stats: dict,
+    log: LogFn,
+    countries: list[str],
+    keep_unknown: bool,
+) -> bool:
     domain = candidate.domain
     log(f"[{index}/{total}] Checking {domain}")
 
@@ -259,7 +293,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
                 "reject_reason": "filtered_demo_or_test_store",
             },
         )
-        stats["this_run_rejected_domains"].append(final_domain or domain)
+        _append_stat(stats, "this_run_rejected_domains", final_domain or domain)
         return True
 
     shopify_status = detect_shopify(homepage.text, homepage.headers)
@@ -299,7 +333,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         )
         return True
 
-    stats["shopify"] += 1
+    _add_stat(stats, "shopify")
     if is_password_page(homepage.text):
         _reject(
             connection,
@@ -332,7 +366,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         )
         return True
     if not profile.product_names:
-        stats["low"] += 1
+        _add_stat(stats, "low")
         _reject(
             connection,
             stats,
@@ -354,10 +388,10 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         f"  Country: {published_country or 'not published'}"
         + (f" ({country_code})" if country_code else "")
     )
-    if config.TARGET_COUNTRIES:
+    if countries:
         allowed, country_reason = country_allows(
             published_country,
-            config.TARGET_COUNTRIES,
+            countries,
             False,
         )
         if not allowed:
@@ -394,9 +428,9 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
         "freshness_level": "HIGH",
         "freshness_evidence": profile.evidence(),
     }
-    stats["high"] += 1
+    _add_stat(stats, "high")
     if (record.get("public_email") or "").strip():
-        stats["emails"] += 1
+        _add_stat(stats, "emails")
         log(f"  Email: {record['public_email']}")
     else:
         log("  Email: not published on the store")
@@ -404,7 +438,7 @@ def _process_candidate(connection, candidate, index: int, total: int, stats: dic
     clear_password_watch(connection, final_domain)
     if domain != final_domain:
         clear_password_watch(connection, domain)
-    stats["this_run_lead_domains"].append(final_domain)
+    _append_stat(stats, "this_run_lead_domains", final_domain)
     log("  Status: saved for download")
 
     if final_domain != domain:
@@ -426,7 +460,7 @@ def _reject(connection, stats, domain, final_domain, candidate, contacts, reason
         "reject_reason": reason,
     }
     upsert_rejected(connection, record)
-    stats["this_run_rejected_domains"].append(final_domain)
+    _append_stat(stats, "this_run_rejected_domains", final_domain)
     log(f"  Status: {status}")
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)

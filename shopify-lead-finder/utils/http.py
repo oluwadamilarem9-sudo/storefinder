@@ -10,7 +10,7 @@ from __future__ import annotations
 import ssl
 import time
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, local
 
 import requests
 
@@ -19,16 +19,39 @@ from config import USER_AGENT
 from utils.normalization import normalize_domain, same_domain
 from utils.robots import robots_allowed
 
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/json,application/atom+xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en",
-    }
-)
+_SESSION_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/json,application/atom+xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en",
+}
+_THREAD_STATE = local()
+_HOST_LOCK = Lock()
+_NEXT_REQUEST_AT: dict[str, float] = {}
 
-_LOCK = Lock()
+
+def _session() -> requests.Session:
+    """One connection pool per worker, so users do not share a single download lock."""
+    session = getattr(_THREAD_STATE, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(_SESSION_HEADERS)
+        _THREAD_STATE.session = session
+    return session
+
+
+def _wait_for_host(url: str) -> None:
+    """Pause only when this same website was just requested."""
+    host = normalize_domain(url) or url
+    delay = config.REQUEST_DELAY
+    while True:
+        with _HOST_LOCK:
+            now = time.monotonic()
+            ready_at = _NEXT_REQUEST_AT.get(host, 0.0)
+            if now >= ready_at:
+                _NEXT_REQUEST_AT[host] = now + delay
+                return
+            wait_for = ready_at - now
+        time.sleep(wait_for)
 
 
 @dataclass
@@ -69,15 +92,14 @@ def fetch_public(
 
     for attempt in range(config.MAX_RETRIES + 1):
         try:
-            with _LOCK:
-                time.sleep(config.REQUEST_DELAY)
-                response = SESSION.get(
-                    url,
-                    timeout=timeout or config.REQUEST_TIMEOUT,
-                    allow_redirects=True,
-                    headers=headers,
-                    stream=bool(max_bytes),
-                )
+            _wait_for_host(url)
+            response = _session().get(
+                url,
+                timeout=timeout or config.REQUEST_TIMEOUT,
+                allow_redirects=True,
+                headers=headers,
+                stream=bool(max_bytes),
+            )
 
             if not allow_cross_domain_redirect and not same_domain(url, response.url):
                 return FetchResult(
@@ -143,7 +165,7 @@ def fetch_public(
         except UnicodeError:
             last_error = "invalid_html"
 
-        if attempt >= MAX_RETRIES:
+        if attempt >= config.MAX_RETRIES:
             break
 
     return FetchResult(url=url, error=last_error)

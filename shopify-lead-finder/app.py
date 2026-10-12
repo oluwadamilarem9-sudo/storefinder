@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -42,11 +43,6 @@ OUTPUT_FILE = _config.OUTPUT_FILE
 REJECTED_FILE = _config.REJECTED_FILE
 TARGET_COUNTRIES = _config.TARGET_COUNTRIES
 project_storage_paths = _config.project_storage_paths
-import importlib
-
-import database.database as dbmod
-
-importlib.reload(dbmod)
 from database.database import (
     connect,
     delete_leads,
@@ -59,37 +55,39 @@ from utils.countries import COUNTRY_CHOICES, country_label
 
 
 def _load_run_cycle():
-    """Reload discovery modules so Streamlit does not keep a stale empty engine."""
-    import importlib
+    """Use the discovery cycle already loaded in this app process."""
+    from pipeline import run_cycle
 
-    import contact.public_contact_finder
-    import database.database
-    import detection.shopify_detector
-    import detection.storefront_profile
-    import discovery.candidate_manager
-    import discovery.discovery_sources
-    import discovery.domain_discovery
-    import pipeline
-    import utils.countries
-    import utils.normalization
-
-    importlib.reload(utils.normalization)
-    importlib.reload(database.database)
-    importlib.reload(utils.countries)
-    importlib.reload(contact.public_contact_finder)
-    importlib.reload(detection.shopify_detector)
-    importlib.reload(detection.storefront_profile)
-    importlib.reload(discovery.discovery_sources)
-    importlib.reload(discovery.domain_discovery)
-    importlib.reload(discovery.candidate_manager)
-    importlib.reload(pipeline)
-    return pipeline.run_cycle
+    return run_cycle
 
 st.set_page_config(
     page_title="Shopify Public Lead Finder",
     page_icon="🛍️",
     layout="wide",
 )
+
+
+def _start_shared_workers() -> None:
+    """Let this website machine run several cycles while people keep using the page."""
+    if not os.environ.get("DATABASE_URL", "").strip():
+        try:
+            secret = str(st.secrets["DATABASE_URL"]).strip()
+        except Exception:
+            secret = ""
+        if secret:
+            os.environ["DATABASE_URL"] = secret
+    try:
+        import account_db
+
+        if account_db.using_database():
+            from discovery_worker import start_worker_pool
+
+            start_worker_pool()
+    except Exception as exc:
+        print(f"Discovery workers did not start: {exc}")
+
+
+_start_shared_workers()
 
 
 def _project_storage():
@@ -136,6 +134,23 @@ def _load_project_tables(storage: dict, token: str, project_id: str) -> tuple[pd
     leads_df = _merge_account_rows(leads_df, remote_leads, {"source": "discovery_source"})
     rejected_df = _merge_account_rows(rejected_df, remote_rejected, {"reason": "reject_reason"})
     return leads_df, rejected_df
+
+
+def _clear_saved_tables() -> None:
+    st.session_state.pop("cached_leads", None)
+    st.session_state.pop("cached_rejected", None)
+    st.session_state.pop("tables_project", None)
+
+
+def _project_tables_cached(storage: dict, token: str, project_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load a project's rows once per visit. A new run or delete refreshes them."""
+    key = str(project_id)
+    if st.session_state.get("tables_project") != key:
+        leads_df, rejected_df = _load_project_tables(storage, token, project_id)
+        st.session_state.tables_project = key
+        st.session_state.cached_leads = leads_df
+        st.session_state.cached_rejected = rejected_df
+    return st.session_state.cached_leads, st.session_state.cached_rejected
 
 
 def _seed_project_history(storage: dict, token: str, project_id: str) -> None:
@@ -234,6 +249,10 @@ if "backend_projects" not in st.session_state:
     st.session_state.backend_projects = []
 if "backend_run_id" not in st.session_state:
     st.session_state.backend_run_id = None
+if "active_run_id" not in st.session_state:
+    st.session_state.active_run_id = None
+if "active_run_project" not in st.session_state:
+    st.session_state.active_run_project = None
 
 
 def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, token: str, db_path: Path):
@@ -434,7 +453,7 @@ storage = _project_storage()
 if storage is None:
     leads_df, rejected_df = pd.DataFrame(), pd.DataFrame()
 else:
-    leads_df, rejected_df = _load_project_tables(
+    leads_df, rejected_df = _project_tables_cached(
         storage,
         st.session_state.auth_token,
         st.session_state.selected_project_id,
@@ -462,6 +481,40 @@ if run_clicked:
         st.warning("Please sign in and create/select a project before running discovery.")
         st.stop()
 
+    project_id = st.session_state.get("selected_project_id")
+    storage = _project_storage()
+    if storage is None:
+        st.warning("Please sign in and create/select a project before running discovery.")
+        st.stop()
+
+    import account_db
+
+    if account_db.using_database():
+        try:
+            backend_run = _backend_request(
+                f"/projects/{project_id}/runs",
+                method="POST",
+                payload={
+                    "name": f"Discovery run {len(st.session_state.logs) + 1}",
+                    "max_domains": int(max_domains),
+                    "settings": {
+                        "max_domains": int(max_domains),
+                        "enable_secondary": bool(enable_secondary),
+                        "target_countries": [] if all_countries else list(selected_country_codes),
+                        "keep_unknown_country": bool(keep_unknown_country),
+                    },
+                },
+                token=st.session_state.auth_token,
+            )
+        except RuntimeError as exc:
+            st.warning(f"Project run could not be created in the backend: {exc}")
+            st.stop()
+        st.session_state.backend_run_id = backend_run.get("id")
+        st.session_state.active_run_id = backend_run.get("id")
+        st.session_state.active_run_project = project_id
+        st.session_state.logs = ["Cycle queued. It runs alongside other people's cycles."]
+        st.rerun()
+
     log_box = st.empty()
     logs: list[str] = []
 
@@ -469,13 +522,10 @@ if run_clicked:
         logs.append(message)
         log_box.code("\n".join(logs[-40:]), language="text")
 
-    project_id = st.session_state.get("selected_project_id")
-    storage = _project_storage()
-    if storage is None:
-        st.warning("Please sign in and create/select a project before running discovery.")
-        st.stop()
     try:
-        _seed_project_history(storage, st.session_state.auth_token, project_id)
+        if st.session_state.get("history_seed_project") != str(project_id):
+            _seed_project_history(storage, st.session_state.auth_token, project_id)
+            st.session_state.history_seed_project = str(project_id)
     except RuntimeError as exc:
         st.warning(f"This project's history could not be loaded: {exc}")
         st.stop()
@@ -555,8 +605,41 @@ if run_clicked:
             "Discovery did not complete. Public sources did not give any unused "
             "website to check this run. Open the Activity log."
         )
+    _clear_saved_tables()
     st.rerun()
 
+def _refresh_active_run() -> bool:
+    """Copy a queued cycle onto the page. Return True while it is still running."""
+    run_id = st.session_state.get("active_run_id")
+    project_id = st.session_state.get("active_run_project")
+    if not run_id or not project_id or not st.session_state.get("auth_token"):
+        return False
+    try:
+        info = _backend_request(
+            f"/projects/{project_id}/runs/{run_id}",
+            token=st.session_state.auth_token,
+        )
+    except RuntimeError as exc:
+        st.session_state.flash_kind = "warning"
+        st.session_state.flash = f"This cycle could not be read: {exc}"
+        st.session_state.active_run_id = None
+        return False
+    log_text = str(info.get("log") or "")
+    st.session_state.logs = log_text.splitlines() or ["Cycle queued. It runs alongside other people's cycles."]
+    status = str(info.get("status") or "")
+    if status in {"queued", "running"}:
+        return True
+    st.session_state.last_stats = info.get("stats") or {}
+    st.session_state.this_run_lead_domains = list(info.get("lead_domains") or [])
+    st.session_state.this_run_rejected_domains = list(info.get("rejected_domains") or [])
+    st.session_state.flash = str(info.get("summary") or "Discovery did not complete.")
+    st.session_state.flash_kind = "success" if info.get("complete") else "warning"
+    st.session_state.active_run_id = None
+    _clear_saved_tables()
+    st.rerun()
+
+
+_cycle_still_running = _refresh_active_run()
 if st.session_state.flash:
     if st.session_state.flash_kind == "success":
         st.success(st.session_state.flash)
@@ -657,6 +740,7 @@ with leads_tab:
                     connection.close()
                 st.session_state.flash_kind = "success"
                 st.session_state.flash = f"Deleted {removed} qualifying lead(s)."
+                _clear_saved_tables()
                 st.rerun()
         if delete_all_leads:
             connection = connect(storage["db"])
@@ -666,6 +750,7 @@ with leads_tab:
                 connection.close()
             st.session_state.flash_kind = "success"
             st.session_state.flash = f"Deleted all {removed} qualifying lead(s)."
+            _clear_saved_tables()
             st.rerun()
         st.caption("Saved for this project only.")
 
@@ -734,6 +819,7 @@ with rejected_tab:
                     connection.close()
                 st.session_state.flash_kind = "success"
                 st.session_state.flash = f"Deleted {removed} rejected candidate(s)."
+                _clear_saved_tables()
                 st.rerun()
         if delete_all:
             connection = connect(storage["db"])
@@ -743,6 +829,7 @@ with rejected_tab:
                 connection.close()
             st.session_state.flash_kind = "success"
             st.session_state.flash = f"Deleted all {removed} rejected candidate(s)."
+            _clear_saved_tables()
             st.rerun()
         st.caption("Saved for this project only.")
 
@@ -758,3 +845,8 @@ Email and country are copied from the shop's own pages when they are published.
 A password wall or an empty catalog is rejected. Sales and revenue are not estimated.
 """
 )
+
+if _cycle_still_running:
+    time.sleep(2)
+    st.rerun()
+

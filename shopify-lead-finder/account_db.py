@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import uuid
+import json
 from datetime import datetime, timezone
 
 import bcrypt
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, create_engine
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
@@ -46,6 +48,11 @@ class DiscoveryRun(Base):
     name = Column(String, nullable=True)
     status = Column(String, default="queued", nullable=False)
     max_domains = Column(Integer, default=20)
+    settings_json = Column(Text, nullable=True)
+    log_text = Column(Text, nullable=True)
+    summary = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    result_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -130,9 +137,33 @@ def _session(url: str):
             kwargs["connect_args"] = {"check_same_thread": False}
         engine = create_engine(url, **kwargs)
         Base.metadata.create_all(bind=engine)
+        _ensure_run_columns(engine)
         _engine = engine
         _Session = sessionmaker(bind=engine)
     return _Session()
+
+
+def _ensure_run_columns(engine) -> None:
+    """Add queue columns on databases created before cycles could run together."""
+    from sqlalchemy import inspect
+
+    try:
+        existing = {column["name"] for column in inspect(engine).get_columns("discovery_runs")}
+    except Exception:
+        return
+    extra = {
+        "settings_json": "TEXT",
+        "log_text": "TEXT",
+        "summary": "TEXT",
+        "error": "TEXT",
+        "result_json": "TEXT",
+    }
+    missing = [name for name in extra if name not in existing]
+    if not missing:
+        return
+    with engine.begin() as connection:
+        for name in missing:
+            connection.execute(text(f"ALTER TABLE discovery_runs ADD COLUMN {name} {extra[name]}"))
 
 
 def _route(session, path: str, method: str, payload: dict, token: str):
@@ -160,10 +191,19 @@ def _route(session, path: str, method: str, payload: dict, token: str):
             name=payload.get("name") or "Discovery run",
             max_domains=int(payload.get("max_domains") or 20),
             status="queued",
+            settings_json=json.dumps(payload.get("settings") or {}),
         )
         session.add(run)
         session.commit()
         return {"id": run.id, "name": run.name, "status": run.status}
+    one_run = re.fullmatch(r"/projects/([^/]+)/runs/([^/]+)", path)
+    if one_run and method == "GET":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, one_run.group(1))
+        run = session.get(DiscoveryRun, one_run.group(2))
+        if run is None or run.project_id != project.id or run.user_id != user.id:
+            raise RuntimeError("Run not found")
+        return _run_public(run)
     lead_match = re.fullmatch(r"/projects/([^/]+)/leads", path)
     if lead_match and method == "GET":
         user = _require_user(session, token)
@@ -214,6 +254,203 @@ def _route(session, path: str, method: str, payload: dict, token: str):
         session.commit()
         return {"id": row.id, "domain": row.domain}
     raise RuntimeError(f"Unsupported account request: {method} {path}")
+
+
+def _run_public(run: DiscoveryRun) -> dict:
+    result = {}
+    if run.result_json:
+        try:
+            parsed = json.loads(run.result_json)
+            if isinstance(parsed, dict):
+                result = parsed
+        except json.JSONDecodeError:
+            result = {}
+    return {
+        "id": run.id,
+        "status": run.status,
+        "log": run.log_text or "",
+        "summary": run.summary or "",
+        "error": run.error or "",
+        "saved": int(result.get("saved") or 0),
+        "complete": bool(result.get("complete")),
+        "lead_domains": list(result.get("lead_domains") or []),
+        "rejected_domains": list(result.get("rejected_domains") or []),
+        "stats": result.get("stats") or {},
+    }
+
+
+_CLAIM_LOCK = threading.Lock()
+
+
+def claim_next_run() -> dict | None:
+    """Take the oldest queued cycle. Other machines skip a cycle already taken."""
+    url = database_url()
+    if not url:
+        return None
+    session = _session(url)
+    try:
+        if session.get_bind().dialect.name == "postgresql":
+            found = session.execute(
+                text(
+                    """
+                    UPDATE discovery_runs
+                    SET status = 'running'
+                    WHERE id = (
+                        SELECT id FROM discovery_runs
+                        WHERE status = 'queued'
+                        ORDER BY created_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    RETURNING id
+                    """
+                )
+            ).first()
+            session.commit()
+            if not found:
+                return None
+            run = session.get(DiscoveryRun, found[0])
+            return None if run is None else _job_dict(run)
+        with _CLAIM_LOCK:
+            run = (
+                session.query(DiscoveryRun)
+                .filter(DiscoveryRun.status == "queued")
+                .order_by(DiscoveryRun.created_at)
+                .first()
+            )
+            if run is None:
+                return None
+            run.status = "running"
+            session.commit()
+            return _job_dict(run)
+    finally:
+        session.close()
+
+
+def save_run_log(run_id: str, log_text: str) -> None:
+    url = database_url()
+    if not url:
+        return
+    session = _session(url)
+    try:
+        run = session.get(DiscoveryRun, run_id)
+        if run is None:
+            return
+        run.log_text = log_text[-20000:]
+        session.commit()
+    finally:
+        session.close()
+
+
+def finish_run(run_id: str, *, status: str, summary: str, result: dict, error: str = "") -> None:
+    url = database_url()
+    if not url:
+        return
+    session = _session(url)
+    try:
+        run = session.get(DiscoveryRun, run_id)
+        if run is None:
+            return
+        run.status = status
+        run.summary = summary
+        run.error = (error or "")[:500]
+        run.result_json = json.dumps(result, default=str)
+        session.commit()
+    finally:
+        session.close()
+
+
+def _job_dict(run: DiscoveryRun) -> dict:
+    settings = {}
+    if run.settings_json:
+        try:
+            parsed = json.loads(run.settings_json)
+            if isinstance(parsed, dict):
+                settings = parsed
+        except json.JSONDecodeError:
+            settings = {}
+    return {
+        "id": run.id,
+        "project_id": run.project_id,
+        "user_id": run.user_id,
+        "max_domains": int(run.max_domains or 20),
+        "settings": settings,
+    }
+
+
+def project_history(project_id: str) -> tuple[list[str], list[dict]]:
+    """Domains already saved for a project, plus password-page rows to watch again."""
+    url = database_url()
+    if not url:
+        return [], []
+    session = _session(url)
+    try:
+        leads = [row.domain for row in session.query(Lead).filter(Lead.project_id == project_id).all() if row.domain]
+        rejected = [
+            {"domain": row.domain, "reason": row.reason or ""}
+            for row in session.query(RejectedCandidate).filter(RejectedCandidate.project_id == project_id).all()
+            if row.domain
+        ]
+        return leads, rejected
+    finally:
+        session.close()
+
+
+def store_run_rows(project_id: str, user_id: str, run_id: str, leads: list[dict], rejected: list[dict]) -> None:
+    """Copy this cycle's new rows into the shared account database."""
+    url = database_url()
+    if not url:
+        return
+    session = _session(url)
+    try:
+        known_leads = {
+            row.domain
+            for row in session.query(Lead).filter(Lead.project_id == project_id).all()
+            if row.domain
+        }
+        known_rejected = {
+            row.domain
+            for row in session.query(RejectedCandidate).filter(RejectedCandidate.project_id == project_id).all()
+            if row.domain
+        }
+        for item in leads:
+            domain = str(item.get("domain") or "")
+            if not domain or domain in known_leads:
+                continue
+            session.add(
+                Lead(
+                    project_id=project_id,
+                    user_id=user_id,
+                    run_id=run_id,
+                    domain=domain,
+                    store_name=item.get("store_name"),
+                    public_email=item.get("public_email"),
+                    country=item.get("country"),
+                    freshness_level=item.get("freshness_level"),
+                    freshness_score=item.get("freshness_score"),
+                    source=item.get("source"),
+                )
+            )
+            known_leads.add(domain)
+        for item in rejected:
+            domain = str(item.get("domain") or "")
+            if not domain or domain in known_rejected or domain in known_leads:
+                continue
+            session.add(
+                RejectedCandidate(
+                    project_id=project_id,
+                    user_id=user_id,
+                    run_id=run_id,
+                    domain=domain,
+                    store_name=item.get("store_name"),
+                    public_email=item.get("public_email"),
+                    reason=item.get("reason"),
+                )
+            )
+            known_rejected.add(domain)
+        session.commit()
+    finally:
+        session.close()
 
 
 def _signup(session, payload: dict):
