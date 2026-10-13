@@ -726,6 +726,9 @@ if st.session_state.flash:
     else:
         st.info(st.session_state.flash)
 
+if _cycle_still_running:
+    st.info("Discovery is running. Each website is added to the activity log as it is checked.")
+
 with st.expander("Last cycle activity log", expanded=True):
     st.code("\n".join(st.session_state.logs), language="text")
 

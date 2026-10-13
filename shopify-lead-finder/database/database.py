@@ -55,9 +55,10 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     """Open the local database and create tables if needed."""
     db_path = path or DATABASE_FILE
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, check_same_thread=False)
+    connection = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=30000")
     _create_tables(connection)
     _migrate_leads(connection)
     _rehome_unscored_leads(connection)
@@ -177,15 +178,27 @@ def remember_domains(
     from utils.normalization import normalize_domain
 
     known = known_domains(connection)
-    added = 0
+    timestamp = now_iso()
+    rows = []
     for raw in domains:
         domain = normalize_domain(str(raw or ""))
         if not domain or domain in known:
             continue
-        mark_processed(connection, domain, "UNKNOWN", source)
         known.add(domain)
-        added += 1
-    return added
+        rows.append((domain, timestamp, timestamp, "UNKNOWN", source))
+    if not rows:
+        return 0
+    with _DB_LOCK:
+        connection.executemany(
+            """
+            INSERT INTO processed_domains (domain, first_seen, last_checked, shopify_status, discovery_source)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(domain) DO NOTHING
+            """,
+            rows,
+        )
+        connection.commit()
+    return len(rows)
 
 
 def known_domains(connection: sqlite3.Connection) -> set[str]:

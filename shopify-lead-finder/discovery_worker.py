@@ -60,18 +60,21 @@ def execute_run(job: dict) -> None:
 
     settings = job.get("settings") or {}
     paths = config.project_storage_paths(str(job["user_id"]), str(job["project_id"]))
-    lines: list[str] = ["Cycle started. Searching public sources for shops on their own domain."]
-    account_db.save_run_log(job["id"], lines[0])
-    _seed_history(paths["db"], str(job["project_id"]))
-    last_flush = time.monotonic()
+    lines: list[str] = []
+    last_flush = 0.0
 
     def on_log(message: str) -> None:
         nonlocal last_flush
         lines.append(message)
         now = time.monotonic()
-        if now - last_flush >= 2:
+        if now - last_flush >= 1 or len(lines) <= 4:
             account_db.save_run_log(job["id"], "\n".join(lines[-80:]))
             last_flush = now
+
+    on_log("Cycle started. Searching public sources for shops on their own domain.")
+    on_log("Loading websites already checked for this project.")
+    _seed_history(paths["db"], str(job["project_id"]))
+    on_log("Searching public sources. Checked websites will appear here.")
 
     countries = settings.get("target_countries")
     if not isinstance(countries, list):
