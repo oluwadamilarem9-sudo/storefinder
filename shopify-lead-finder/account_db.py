@@ -110,14 +110,23 @@ def using_database() -> bool:
     return bool(database_url())
 
 
+def _clean_path(path: str) -> str:
+    return (path or "").strip().split("?", 1)[0].rstrip("/")
+
+
 def handle(path: str, method: str, payload: dict | None, token: str | None):
     url = database_url()
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
+    method_name = (method or "GET").upper()
+    cleaned = _clean_path(path)
+    one_run = re.fullmatch(r"/projects/([^/]+)/runs/([^/]+)", cleaned)
+    if one_run and method_name == "GET":
+        return get_project_run(one_run.group(1), one_run.group(2), token or "")
     try:
         session = _session(url)
         try:
-            return _route(session, path, method.upper(), payload or {}, token or "")
+            return _route(session, cleaned, method_name, payload or {}, token or "")
         finally:
             try:
                 session.close()
@@ -211,9 +220,14 @@ def _route(session, path: str, method: str, payload: dict, token: str):
         session.add(run)
         session.commit()
         return {"id": run.id, "name": run.name, "status": run.status}
-    one_run = re.fullmatch(r"/projects/([^/]+)/runs/([^/]+)", path.strip())
+    one_run = re.fullmatch(r"/projects/([^/]+)/runs/([^/]+)", _clean_path(path))
     if one_run and method == "GET":
-        return get_project_run(one_run.group(1), one_run.group(2), token)
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, one_run.group(1))
+        run = session.get(DiscoveryRun, one_run.group(2))
+        if run is None or run.project_id != project.id or run.user_id != user.id:
+            raise RuntimeError("Run not found")
+        return _run_public(run)
     lead_match = re.fullmatch(r"/projects/([^/]+)/leads", path)
     if lead_match and method == "GET":
         user = _require_user(session, token)
@@ -278,6 +292,32 @@ def get_project_run(project_id: str, run_id: str, token: str) -> dict:
         run = session.get(DiscoveryRun, run_id)
         if run is None or run.project_id != project.id or run.user_id != user.id:
             raise RuntimeError("Run not found")
+        return _run_public(run)
+    finally:
+        session.close()
+
+
+def latest_open_run(project_id: str, token: str) -> dict | None:
+    """Return the signed-in project's cycle that is still queued or running."""
+    url = database_url()
+    if not url:
+        return None
+    session = _session(url)
+    try:
+        user = _require_user(session, token or "")
+        project = _owned_project(session, user.id, project_id)
+        run = (
+            session.query(DiscoveryRun)
+            .filter(
+                DiscoveryRun.project_id == project.id,
+                DiscoveryRun.user_id == user.id,
+                DiscoveryRun.status.in_(("queued", "running")),
+            )
+            .order_by(DiscoveryRun.created_at.desc())
+            .first()
+        )
+        if run is None:
+            return None
         return _run_public(run)
     finally:
         session.close()

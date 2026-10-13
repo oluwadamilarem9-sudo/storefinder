@@ -34,7 +34,12 @@ def start_worker_pool() -> None:
 
 def worker_loop() -> None:
     while True:
-        job = account_db.claim_next_run()
+        try:
+            job = account_db.claim_next_run()
+        except Exception as exc:
+            print(f"Discovery worker could not take a cycle: {exc}")
+            time.sleep(3)
+            continue
         if job is None:
             time.sleep(1)
             continue
@@ -56,7 +61,8 @@ def execute_run(job: dict) -> None:
     settings = job.get("settings") or {}
     paths = config.project_storage_paths(str(job["user_id"]), str(job["project_id"]))
     _seed_history(paths["db"], str(job["project_id"]))
-    lines: list[str] = []
+    lines: list[str] = ["Cycle started. Searching public sources for shops on their own domain."]
+    account_db.save_run_log(job["id"], lines[0])
     last_flush = time.monotonic()
 
     def on_log(message: str) -> None:

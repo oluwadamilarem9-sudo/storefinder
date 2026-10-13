@@ -68,12 +68,14 @@ st.set_page_config(
 
 
 def _load_account_db():
-    """Reload account storage so a long-running app sees new cycle routes."""
+    """Use account storage. Reload once if this process still has the old module."""
     import importlib
 
     import account_db
 
-    return importlib.reload(account_db)
+    if not hasattr(account_db, "get_project_run") or not hasattr(account_db, "latest_open_run"):
+        account_db = importlib.reload(account_db)
+    return account_db
 
 
 def _start_shared_workers() -> None:
@@ -198,7 +200,7 @@ BACKEND_URL = _resolve_backend_url()
 
 
 def _backend_request(path: str, *, method: str = "GET", payload: dict | None = None, token: str | None = None):
-    import account_db
+    account_db = _load_account_db()
     if account_db.using_database():
         return account_db.handle(path, method, payload, token)
     headers = {}
@@ -520,7 +522,8 @@ if run_clicked:
         st.session_state.backend_run_id = backend_run.get("id")
         st.session_state.active_run_id = backend_run.get("id")
         st.session_state.active_run_project = project_id
-        st.session_state.logs = ["Cycle queued. It runs alongside other people's cycles."]
+        st.session_state.flash = ""
+        st.session_state.logs = ["Cycle started. Searching public sources for shops on their own domain."]
         st.rerun()
 
     log_box = st.empty()
@@ -616,23 +619,84 @@ if run_clicked:
     _clear_saved_tables()
     st.rerun()
 
-def _refresh_active_run() -> bool:
-    """Copy a queued cycle onto the page. Return True while it is still running."""
+def _stuck_cycle_message() -> bool:
+    flash = str(st.session_state.get("flash") or "")
+    return "could not be read" in flash or "Unsupported account request" in flash
+
+
+def _clear_stuck_cycle_message() -> None:
+    if _stuck_cycle_message():
+        st.session_state.flash = ""
+        st.session_state.flash_kind = "info"
+    logs = list(st.session_state.get("logs") or [])
+    if logs == ["Cycle queued. It runs alongside other people's cycles."]:
+        st.session_state.logs = [
+            "Ready. Click Run discovery cycle to search public sources automatically."
+        ]
+
+
+def _run_to_follow() -> tuple[str, str] | None:
+    """The cycle this page should show, including one stuck on the old error."""
+    token = st.session_state.get("auth_token")
+    if not token:
+        return None
     run_id = st.session_state.get("active_run_id")
     project_id = st.session_state.get("active_run_project")
-    if not run_id or not project_id or not st.session_state.get("auth_token"):
-        return False
+    if run_id and project_id:
+        return str(project_id), str(run_id)
+    flash = str(st.session_state.get("flash") or "")
+    marker = "/projects/"
+    if marker in flash and "/runs/" in flash:
+        try:
+            project_part, run_part = flash.split("/projects/", 1)[1].split("/runs/", 1)
+            project_id = project_part.split("/", 1)[0].strip()
+            run_id = run_part.split()[0].strip().strip("/")
+            if project_id and run_id:
+                return project_id, run_id
+        except (IndexError, ValueError):
+            pass
+    project_id = st.session_state.get("selected_project_id")
+    if not project_id:
+        return None
     try:
-        import account_db
+        open_run = _load_account_db().latest_open_run(str(project_id), str(token))
+    except RuntimeError:
+        return None
+    if not open_run or not open_run.get("id"):
+        return None
+    return str(project_id), str(open_run["id"])
 
-        info = account_db.get_project_run(str(project_id), str(run_id), str(st.session_state.auth_token))
-    except RuntimeError as exc:
-        st.session_state.flash_kind = "warning"
-        st.session_state.flash = f"This cycle could not be read: {exc}"
-        st.session_state.active_run_id = None
+
+def _refresh_active_run() -> bool:
+    """Copy a queued cycle onto the page. Return True while it is still running."""
+    followed = _run_to_follow()
+    if followed is None:
+        _clear_stuck_cycle_message()
         return False
+    project_id, run_id = followed
+    token = str(st.session_state.auth_token)
+    try:
+        info = _load_account_db().get_project_run(project_id, run_id, token)
+    except RuntimeError as exc:
+        if "not found" in str(exc).lower() or "sign in" in str(exc).lower():
+            st.session_state.active_run_id = None
+            st.session_state.active_run_project = None
+            _clear_stuck_cycle_message()
+            return False
+        st.session_state.active_run_id = run_id
+        st.session_state.active_run_project = project_id
+        st.session_state.flash = ""
+        st.session_state.logs = ["Cycle started. Searching public sources for shops on their own domain."]
+        return True
+    st.session_state.active_run_id = run_id
+    st.session_state.active_run_project = project_id
+    if _stuck_cycle_message():
+        st.session_state.flash = ""
+        st.session_state.flash_kind = "info"
     log_text = str(info.get("log") or "")
-    st.session_state.logs = log_text.splitlines() or ["Cycle queued. It runs alongside other people's cycles."]
+    st.session_state.logs = log_text.splitlines() or [
+        "Cycle started. Searching public sources for shops on their own domain."
+    ]
     status = str(info.get("status") or "")
     if status in {"queued", "running"}:
         return True
@@ -642,6 +706,7 @@ def _refresh_active_run() -> bool:
     st.session_state.flash = str(info.get("summary") or "Discovery did not complete.")
     st.session_state.flash_kind = "success" if info.get("complete") else "warning"
     st.session_state.active_run_id = None
+    st.session_state.active_run_project = None
     _clear_saved_tables()
     st.rerun()
 
