@@ -67,6 +67,15 @@ st.set_page_config(
 )
 
 
+def _load_account_db():
+    """Reload account storage so a long-running app sees new cycle routes."""
+    import importlib
+
+    import account_db
+
+    return importlib.reload(account_db)
+
+
 def _start_shared_workers() -> None:
     """Let this website machine run several cycles while people keep using the page."""
     if not os.environ.get("DATABASE_URL", "").strip():
@@ -77,7 +86,7 @@ def _start_shared_workers() -> None:
         if secret:
             os.environ["DATABASE_URL"] = secret
     try:
-        import account_db
+        account_db = _load_account_db()
 
         if account_db.using_database():
             from discovery_worker import start_worker_pool
@@ -190,7 +199,6 @@ BACKEND_URL = _resolve_backend_url()
 
 def _backend_request(path: str, *, method: str = "GET", payload: dict | None = None, token: str | None = None):
     import account_db
-
     if account_db.using_database():
         return account_db.handle(path, method, payload, token)
     headers = {}
@@ -615,10 +623,9 @@ def _refresh_active_run() -> bool:
     if not run_id or not project_id or not st.session_state.get("auth_token"):
         return False
     try:
-        info = _backend_request(
-            f"/projects/{project_id}/runs/{run_id}",
-            token=st.session_state.auth_token,
-        )
+        import account_db
+
+        info = account_db.get_project_run(str(project_id), str(run_id), str(st.session_state.auth_token))
     except RuntimeError as exc:
         st.session_state.flash_kind = "warning"
         st.session_state.flash = f"This cycle could not be read: {exc}"

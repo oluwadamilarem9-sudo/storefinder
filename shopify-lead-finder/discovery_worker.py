@@ -12,7 +12,7 @@ import threading
 import time
 
 import config
-from account_db import claim_next_run, finish_run, project_history, save_run_log, store_run_rows
+import account_db
 from database.database import connect, load_leads_frame, load_rejected_frame, remember_domains, upsert_rejected
 
 _STARTED = False
@@ -34,14 +34,14 @@ def start_worker_pool() -> None:
 
 def worker_loop() -> None:
     while True:
-        job = claim_next_run()
+        job = account_db.claim_next_run()
         if job is None:
             time.sleep(1)
             continue
         try:
             execute_run(job)
         except Exception as exc:
-            finish_run(
+            account_db.finish_run(
                 job["id"],
                 status="failed",
                 summary="Discovery did not complete. The cycle stopped with an error. Open the Activity log.",
@@ -64,7 +64,7 @@ def execute_run(job: dict) -> None:
         lines.append(message)
         now = time.monotonic()
         if now - last_flush >= 2:
-            save_run_log(job["id"], "\n".join(lines[-80:]))
+            account_db.save_run_log(job["id"], "\n".join(lines[-80:]))
             last_flush = now
 
     countries = settings.get("target_countries")
@@ -80,7 +80,7 @@ def execute_run(job: dict) -> None:
         leads_csv=paths["leads_csv"],
         rejected_csv=paths["rejected_csv"],
     )
-    save_run_log(job["id"], "\n".join(lines[-80:]))
+    account_db.save_run_log(job["id"], "\n".join(lines[-80:]))
     lead_domains = list(result.get("this_run_lead_domains") or [])
     rejected_domains = list(result.get("this_run_rejected_domains") or [])
     _store_rows(paths["db"], job, lead_domains, rejected_domains)
@@ -112,7 +112,7 @@ def execute_run(job: dict) -> None:
         )
         status = "complete"
     stats = {key: value for key, value in result.items() if key not in {"this_run_lead_domains", "this_run_rejected_domains"}}
-    finish_run(
+    account_db.finish_run(
         job["id"],
         status=status,
         summary=summary,
@@ -127,7 +127,7 @@ def execute_run(job: dict) -> None:
 
 
 def _seed_history(db_path, project_id: str) -> None:
-    leads, rejected = project_history(project_id)
+    leads, rejected = account_db.project_history(project_id)
     connection = connect(db_path)
     try:
         remember_domains(connection, leads)
@@ -200,4 +200,4 @@ def _store_rows(db_path, job: dict, lead_domains: list[str], rejected_domains: l
                     "reason": _clean_cell(row.get("reject_reason")) or "rejected_by_filters",
                 }
             )
-    store_run_rows(str(job["project_id"]), str(job["user_id"]), str(job["id"]), leads, rejected)
+    account_db.store_run_rows(str(job["project_id"]), str(job["user_id"]), str(job["id"]), leads, rejected)

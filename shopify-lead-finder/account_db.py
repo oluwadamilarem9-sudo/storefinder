@@ -143,14 +143,13 @@ def _session(url: str):
     return _Session()
 
 
+_SCHEMA_LOCK = threading.Lock()
+
+
 def _ensure_run_columns(engine) -> None:
     """Add queue columns on databases created before cycles could run together."""
     from sqlalchemy import inspect
 
-    try:
-        existing = {column["name"] for column in inspect(engine).get_columns("discovery_runs")}
-    except Exception:
-        return
     extra = {
         "settings_json": "TEXT",
         "log_text": "TEXT",
@@ -158,12 +157,28 @@ def _ensure_run_columns(engine) -> None:
         "error": "TEXT",
         "result_json": "TEXT",
     }
-    missing = [name for name in extra if name not in existing]
-    if not missing:
-        return
-    with engine.begin() as connection:
-        for name in missing:
-            connection.execute(text(f"ALTER TABLE discovery_runs ADD COLUMN {name} {extra[name]}"))
+    with _SCHEMA_LOCK:
+        try:
+            existing = {column["name"] for column in inspect(engine).get_columns("discovery_runs")}
+        except Exception:
+            return
+        missing = [name for name in extra if name not in existing]
+        if not missing:
+            return
+        is_postgres = engine.dialect.name == "postgresql"
+        with engine.begin() as connection:
+            for name in missing:
+                if is_postgres:
+                    statement = f"ALTER TABLE discovery_runs ADD COLUMN IF NOT EXISTS {name} {extra[name]}"
+                else:
+                    statement = f"ALTER TABLE discovery_runs ADD COLUMN {name} {extra[name]}"
+                try:
+                    connection.execute(text(statement))
+                except Exception as exc:
+                    message = str(exc).lower()
+                    if "duplicate column" in message or "already exists" in message:
+                        continue
+                    raise
 
 
 def _route(session, path: str, method: str, payload: dict, token: str):
@@ -196,14 +211,9 @@ def _route(session, path: str, method: str, payload: dict, token: str):
         session.add(run)
         session.commit()
         return {"id": run.id, "name": run.name, "status": run.status}
-    one_run = re.fullmatch(r"/projects/([^/]+)/runs/([^/]+)", path)
+    one_run = re.fullmatch(r"/projects/([^/]+)/runs/([^/]+)", path.strip())
     if one_run and method == "GET":
-        user = _require_user(session, token)
-        project = _owned_project(session, user.id, one_run.group(1))
-        run = session.get(DiscoveryRun, one_run.group(2))
-        if run is None or run.project_id != project.id or run.user_id != user.id:
-            raise RuntimeError("Run not found")
-        return _run_public(run)
+        return get_project_run(one_run.group(1), one_run.group(2), token)
     lead_match = re.fullmatch(r"/projects/([^/]+)/leads", path)
     if lead_match and method == "GET":
         user = _require_user(session, token)
@@ -254,6 +264,23 @@ def _route(session, path: str, method: str, payload: dict, token: str):
         session.commit()
         return {"id": row.id, "domain": row.domain}
     raise RuntimeError(f"Unsupported account request: {method} {path}")
+
+
+def get_project_run(project_id: str, run_id: str, token: str) -> dict:
+    """Read one cycle for the signed-in project."""
+    url = database_url()
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    session = _session(url)
+    try:
+        user = _require_user(session, token or "")
+        project = _owned_project(session, user.id, project_id)
+        run = session.get(DiscoveryRun, run_id)
+        if run is None or run.project_id != project.id or run.user_id != user.id:
+            raise RuntimeError("Run not found")
+        return _run_public(run)
+    finally:
+        session.close()
 
 
 def _run_public(run: DiscoveryRun) -> dict:
