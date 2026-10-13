@@ -141,9 +141,11 @@ def handle(path: str, method: str, payload: dict | None, token: str | None):
 
 
 _ENGINE_LOCK = threading.Lock()
+_DB_SLOTS = threading.BoundedSemaphore(2)
 
 
 def _session(url: str):
+    """Open one database session. Never keep more than two of these at once."""
     global _engine, _Session
     if _Session is None:
         with _ENGINE_LOCK:
@@ -156,7 +158,28 @@ def _session(url: str):
                 _ensure_run_columns(engine)
                 _engine = engine
                 _Session = sessionmaker(bind=engine)
-    return _Session()
+    if not _DB_SLOTS.acquire(timeout=12):
+        raise RuntimeError("The account database is busy. Wait a moment and try again.")
+    try:
+        session = _Session()
+    except Exception:
+        _DB_SLOTS.release()
+        raise
+    original_close = session.close
+    closed = False
+
+    def close():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        try:
+            original_close()
+        finally:
+            _DB_SLOTS.release()
+
+    session.close = close
+    return session
 
 
 def _busy(exc: Exception) -> RuntimeError:
@@ -675,4 +698,6 @@ def _iso(value) -> str:
 
 def _public_error(exc: Exception, url: str) -> str:
     text = str(exc).replace(url, "postgresql://***")
+    if "EMAXCONNSESSION" in text or "max clients reached" in text.lower():
+        return "The account database is busy. Wait a moment and try again."
     return text.split("\n")[0][:300]
