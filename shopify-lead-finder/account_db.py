@@ -273,7 +273,7 @@ def _route(session, path: str, method: str, payload: dict, token: str):
             user_id=user.id,
             name=payload.get("name") or "Discovery run",
             max_domains=int(payload.get("max_domains") or 20),
-            status="queued",
+            status="running" if payload.get("on_page") else "queued",
             settings_json=json.dumps(payload.get("settings") or {}),
             log_text="Cycle started. Searching public sources for shops on their own domain.",
             touched_at=datetime.now(timezone.utc).isoformat(),

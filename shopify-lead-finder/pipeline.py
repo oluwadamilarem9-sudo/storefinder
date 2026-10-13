@@ -153,6 +153,43 @@ def run_cycle(
             if not pending:
                 return
 
+            def finish_one(counted, lines) -> None:
+                nonlocal rate_streak
+                for line in lines:
+                    log(line)
+                if counted:
+                    rate_streak = 0
+                else:
+                    stats["checked"] -= 1
+                    rate_streak += 1
+                    if rate_streak >= 8:
+                        stats["slowed_down"] = True
+                        log("Storefronts asked us to slow down. Remaining shops stay for a later run.")
+
+            if min(config.CHECK_WORKERS, len(pending)) <= 1:
+                for candidate, index in pending:
+                    lines: list[str] = []
+                    try:
+                        counted = _process_candidate(
+                            connection,
+                            candidate,
+                            index,
+                            max_domains,
+                            stats,
+                            lines.append,
+                            countries,
+                            keep_unknown,
+                        )
+                    except Exception as exc:
+                        lines.append(f"  Error on {candidate.domain}: {exc}")
+                        try:
+                            mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
+                        except Exception:
+                            pass
+                        counted = True
+                    finish_one(counted, lines)
+                return
+
             def quiet(candidate, index: int):
                 lines: list[str] = []
                 local = connect(db_path)
@@ -184,16 +221,7 @@ def run_cycle(
                 futures = [pool.submit(quiet, candidate, index) for candidate, index in pending]
                 for future in as_completed(futures):
                     counted, lines = future.result()
-                    for line in lines:
-                        log(line)
-                    if counted:
-                        rate_streak = 0
-                    else:
-                        stats["checked"] -= 1
-                        rate_streak += 1
-                        if rate_streak >= 8:
-                            stats["slowed_down"] = True
-                            log("Storefronts asked us to slow down. Remaining shops stay for a later run.")
+                    finish_one(counted, lines)
 
         if watching:
             log(f"Rechecking {len(watching)} shop(s) still behind a password page.")

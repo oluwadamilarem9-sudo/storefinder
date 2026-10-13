@@ -95,11 +95,6 @@ def _start_shared_workers() -> None:
             os.environ["DATABASE_URL"] = secret
     try:
         account_db = _load_account_db()
-
-        if account_db.using_database():
-            from discovery_worker import start_worker_pool
-
-            start_worker_pool()
     except Exception as exc:
         print(f"Discovery workers did not start: {exc}")
 
@@ -503,44 +498,21 @@ if run_clicked:
         st.warning("Please sign in and create/select a project before running discovery.")
         st.stop()
 
-    import account_db
-
-    if account_db.using_database():
-        try:
-            backend_run = _backend_request(
-                f"/projects/{project_id}/runs",
-                method="POST",
-                payload={
-                    "name": f"Discovery run {len(st.session_state.logs) + 1}",
-                    "max_domains": int(max_domains),
-                    "settings": {
-                        "max_domains": int(max_domains),
-                        "enable_secondary": bool(enable_secondary),
-                        "target_countries": [] if all_countries else list(selected_country_codes),
-                        "keep_unknown_country": bool(keep_unknown_country),
-                    },
-                },
-                token=st.session_state.auth_token,
-            )
-        except RuntimeError as exc:
-            st.warning(f"Project run could not be created in the backend: {exc}")
-            st.stop()
-        st.session_state.backend_run_id = backend_run.get("id")
-        st.session_state.active_run_id = backend_run.get("id")
-        st.session_state.active_run_project = project_id
-        st.session_state.flash = ""
-        st.session_state.logs = ["Cycle started. Searching public sources for shops on their own domain."]
-        st.rerun()
-
     log_box = st.empty()
-    logs: list[str] = []
+    logs: list[str] = ["Cycle started. Searching public sources for shops on their own domain."]
+    log_box.code("\n".join(logs[-40:]), language="text")
 
     def on_log(message: str) -> None:
         logs.append(message)
         log_box.code("\n".join(logs[-40:]), language="text")
 
+    st.session_state.active_run_id = None
+    st.session_state.active_run_project = None
+    st.session_state.flash = ""
+
     try:
         if st.session_state.get("history_seed_project") != str(project_id):
+            on_log("Loading websites already checked for this project.")
             _seed_project_history(storage, st.session_state.auth_token, project_id)
             st.session_state.history_seed_project = str(project_id)
     except RuntimeError as exc:
@@ -553,7 +525,17 @@ if run_clicked:
             backend_run = _backend_request(
                 f"/projects/{project_id}/runs",
                 method="POST",
-                payload={"name": f"Discovery run {len(st.session_state.logs) + 1}", "max_domains": int(max_domains)},
+                payload={
+                    "name": f"Discovery run {len(logs)}",
+                    "max_domains": int(max_domains),
+                    "on_page": True,
+                    "settings": {
+                        "max_domains": int(max_domains),
+                        "enable_secondary": bool(enable_secondary),
+                        "target_countries": [] if all_countries else list(selected_country_codes),
+                        "keep_unknown_country": bool(keep_unknown_country),
+                    },
+                },
                 token=st.session_state.auth_token,
             )
             st.session_state.backend_run_id = backend_run.get("id")
@@ -674,47 +656,10 @@ def _run_to_follow() -> tuple[str, str] | None:
 
 
 def _refresh_active_run() -> bool:
-    """Copy a queued cycle onto the page. Return True while it is still running."""
-    followed = _run_to_follow()
-    if followed is None:
-        _clear_stuck_cycle_message()
-        return False
-    project_id, run_id = followed
-    token = str(st.session_state.auth_token)
-    try:
-        info = _load_account_db().get_project_run(project_id, run_id, token)
-    except Exception as exc:
-        if "not found" in str(exc).lower() or "sign in" in str(exc).lower():
-            st.session_state.active_run_id = None
-            st.session_state.active_run_project = None
-            _clear_stuck_cycle_message()
-            return False
-        st.session_state.active_run_id = run_id
-        st.session_state.active_run_project = project_id
-        st.session_state.flash = ""
-        st.session_state.logs = ["Cycle started. Searching public sources for shops on their own domain."]
-        return True
-    st.session_state.active_run_id = run_id
-    st.session_state.active_run_project = project_id
-    if _stuck_cycle_message():
-        st.session_state.flash = ""
-        st.session_state.flash_kind = "info"
-    log_text = str(info.get("log") or "")
-    st.session_state.logs = log_text.splitlines() or [
-        "Cycle started. Searching public sources for shops on their own domain."
-    ]
-    status = str(info.get("status") or "")
-    if status in {"queued", "running"}:
-        return True
-    st.session_state.last_stats = info.get("stats") or {}
-    st.session_state.this_run_lead_domains = list(info.get("lead_domains") or [])
-    st.session_state.this_run_rejected_domains = list(info.get("rejected_domains") or [])
-    st.session_state.flash = str(info.get("summary") or "Discovery did not complete.")
-    st.session_state.flash_kind = "success" if info.get("complete") else "warning"
+    """The cycle runs on this page, so a background job must not take the screen over."""
     st.session_state.active_run_id = None
     st.session_state.active_run_project = None
-    _clear_saved_tables()
-    st.rerun()
+    return False
 
 
 _cycle_still_running = _refresh_active_run()
