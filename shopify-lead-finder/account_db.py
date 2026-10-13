@@ -12,7 +12,7 @@ import re
 import threading
 import uuid
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import bcrypt
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, text
@@ -53,6 +53,7 @@ class DiscoveryRun(Base):
     summary = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
     result_json = Column(Text, nullable=True)
+    touched_at = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -165,6 +166,7 @@ def _ensure_run_columns(engine) -> None:
         "summary": "TEXT",
         "error": "TEXT",
         "result_json": "TEXT",
+        "touched_at": "TEXT",
     }
     with _SCHEMA_LOCK:
         try:
@@ -216,6 +218,8 @@ def _route(session, path: str, method: str, payload: dict, token: str):
             max_domains=int(payload.get("max_domains") or 20),
             status="queued",
             settings_json=json.dumps(payload.get("settings") or {}),
+            log_text="Cycle started. Searching public sources for shops on their own domain.",
+            touched_at=datetime.now(timezone.utc).isoformat(),
         )
         session.add(run)
         session.commit()
@@ -349,6 +353,42 @@ def _run_public(run: DiscoveryRun) -> dict:
 _CLAIM_LOCK = threading.Lock()
 
 
+def _stamp(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _reclaim_stale_runs(session) -> None:
+    """Put a cycle back in the queue when its worker stopped without finishing."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=3)
+    rows = session.query(DiscoveryRun).filter(DiscoveryRun.status == "running").all()
+    changed = False
+    for run in rows:
+        if not str(run.touched_at or "").strip():
+            run.status = "queued"
+            changed = True
+            continue
+        stamp = _stamp(run.touched_at)
+        if stamp is None or stamp < cutoff:
+            run.status = "queued"
+            changed = True
+    if changed:
+        session.commit()
+
+
 def claim_next_run() -> dict | None:
     """Take the oldest queued cycle. Other machines skip a cycle already taken."""
     url = database_url()
@@ -356,12 +396,19 @@ def claim_next_run() -> dict | None:
         return None
     session = _session(url)
     try:
+        _reclaim_stale_runs(session)
         if session.get_bind().dialect.name == "postgresql":
+            now = datetime.now(timezone.utc).isoformat()
             found = session.execute(
                 text(
                     """
                     UPDATE discovery_runs
-                    SET status = 'running'
+                    SET status = 'running',
+                        touched_at = :touched,
+                        log_text = CASE
+                            WHEN log_text IS NULL OR log_text = '' THEN :started
+                            ELSE log_text
+                        END
                     WHERE id = (
                         SELECT id FROM discovery_runs
                         WHERE status = 'queued'
@@ -371,7 +418,11 @@ def claim_next_run() -> dict | None:
                     )
                     RETURNING id
                     """
-                )
+                ),
+                {
+                    "touched": now,
+                    "started": "Cycle started. Searching public sources for shops on their own domain.",
+                },
             ).first()
             session.commit()
             if not found:
@@ -388,6 +439,9 @@ def claim_next_run() -> dict | None:
             if run is None:
                 return None
             run.status = "running"
+            run.touched_at = datetime.now(timezone.utc).isoformat()
+            if not (run.log_text or "").strip():
+                run.log_text = "Cycle started. Searching public sources for shops on their own domain."
             session.commit()
             return _job_dict(run)
     finally:
@@ -404,6 +458,7 @@ def save_run_log(run_id: str, log_text: str) -> None:
         if run is None:
             return
         run.log_text = log_text[-20000:]
+        run.touched_at = datetime.now(timezone.utc).isoformat()
         session.commit()
     finally:
         session.close()

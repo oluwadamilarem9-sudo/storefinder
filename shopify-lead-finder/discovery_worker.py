@@ -60,9 +60,9 @@ def execute_run(job: dict) -> None:
 
     settings = job.get("settings") or {}
     paths = config.project_storage_paths(str(job["user_id"]), str(job["project_id"]))
-    _seed_history(paths["db"], str(job["project_id"]))
     lines: list[str] = ["Cycle started. Searching public sources for shops on their own domain."]
     account_db.save_run_log(job["id"], lines[0])
+    _seed_history(paths["db"], str(job["project_id"]))
     last_flush = time.monotonic()
 
     def on_log(message: str) -> None:

@@ -155,22 +155,29 @@ def run_cycle(
 
             def quiet(candidate, index: int):
                 lines: list[str] = []
+                local = connect(db_path)
                 try:
-                    counted = _process_candidate(
-                        connection,
-                        candidate,
-                        index,
-                        max_domains,
-                        stats,
-                        lines.append,
-                        countries,
-                        keep_unknown,
-                    )
-                except Exception as exc:
-                    lines.append(f"  Error on {candidate.domain}: {exc}")
-                    mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
-                    counted = True
-                return counted, lines
+                    try:
+                        counted = _process_candidate(
+                            local,
+                            candidate,
+                            index,
+                            max_domains,
+                            stats,
+                            lines.append,
+                            countries,
+                            keep_unknown,
+                        )
+                    except Exception as exc:
+                        lines.append(f"  Error on {candidate.domain}: {exc}")
+                        try:
+                            mark_processed(local, candidate.domain, "UNKNOWN", candidate.source)
+                        except Exception:
+                            pass
+                        counted = True
+                    return counted, lines
+                finally:
+                    local.close()
 
             workers = min(config.CHECK_WORKERS, len(pending))
             with ThreadPoolExecutor(max_workers=workers) as pool:
