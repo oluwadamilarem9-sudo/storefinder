@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.pool import NullPool
 
 Base = declarative_base()
 _engine = None
@@ -139,18 +140,28 @@ def handle(path: str, method: str, payload: dict | None, token: str | None):
         raise RuntimeError(f"Account database error: {_public_error(exc, url)}") from exc
 
 
+_ENGINE_LOCK = threading.Lock()
+
+
 def _session(url: str):
     global _engine, _Session
     if _Session is None:
-        kwargs = {"pool_pre_ping": True}
-        if url.startswith("sqlite"):
-            kwargs["connect_args"] = {"check_same_thread": False}
-        engine = create_engine(url, **kwargs)
-        Base.metadata.create_all(bind=engine)
-        _ensure_run_columns(engine)
-        _engine = engine
-        _Session = sessionmaker(bind=engine)
+        with _ENGINE_LOCK:
+            if _Session is None:
+                kwargs = {"poolclass": NullPool}
+                if url.startswith("sqlite"):
+                    kwargs["connect_args"] = {"check_same_thread": False}
+                engine = create_engine(url, **kwargs)
+                Base.metadata.create_all(bind=engine)
+                _ensure_run_columns(engine)
+                _engine = engine
+                _Session = sessionmaker(bind=engine)
     return _Session()
+
+
+def _busy(exc: Exception) -> RuntimeError:
+    """Hide connection details. The database only allows a few open sessions."""
+    return RuntimeError("The account database is busy. The page will try again.")
 
 
 _SCHEMA_LOCK = threading.Lock()
@@ -289,16 +300,21 @@ def get_project_run(project_id: str, run_id: str, token: str) -> dict:
     url = database_url()
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
-    session = _session(url)
     try:
-        user = _require_user(session, token or "")
-        project = _owned_project(session, user.id, project_id)
-        run = session.get(DiscoveryRun, run_id)
-        if run is None or run.project_id != project.id or run.user_id != user.id:
-            raise RuntimeError("Run not found")
-        return _run_public(run)
-    finally:
-        session.close()
+        session = _session(url)
+        try:
+            user = _require_user(session, token or "")
+            project = _owned_project(session, user.id, project_id)
+            run = session.get(DiscoveryRun, run_id)
+            if run is None or run.project_id != project.id or run.user_id != user.id:
+                raise RuntimeError("Run not found")
+            return _run_public(run)
+        finally:
+            session.close()
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise _busy(exc) from exc
 
 
 def latest_open_run(project_id: str, token: str) -> dict | None:
@@ -306,25 +322,30 @@ def latest_open_run(project_id: str, token: str) -> dict | None:
     url = database_url()
     if not url:
         return None
-    session = _session(url)
     try:
-        user = _require_user(session, token or "")
-        project = _owned_project(session, user.id, project_id)
-        run = (
-            session.query(DiscoveryRun)
-            .filter(
-                DiscoveryRun.project_id == project.id,
-                DiscoveryRun.user_id == user.id,
-                DiscoveryRun.status.in_(("queued", "running")),
+        session = _session(url)
+        try:
+            user = _require_user(session, token or "")
+            project = _owned_project(session, user.id, project_id)
+            run = (
+                session.query(DiscoveryRun)
+                .filter(
+                    DiscoveryRun.project_id == project.id,
+                    DiscoveryRun.user_id == user.id,
+                    DiscoveryRun.status.in_(("queued", "running")),
+                )
+                .order_by(DiscoveryRun.created_at.desc())
+                .first()
             )
-            .order_by(DiscoveryRun.created_at.desc())
-            .first()
-        )
-        if run is None:
-            return None
-        return _run_public(run)
-    finally:
-        session.close()
+            if run is None:
+                return None
+            return _run_public(run)
+        finally:
+            session.close()
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise _busy(exc) from exc
 
 
 def _run_public(run: DiscoveryRun) -> dict:

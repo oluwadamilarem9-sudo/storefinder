@@ -677,7 +677,7 @@ def _refresh_active_run() -> bool:
     token = str(st.session_state.auth_token)
     try:
         info = _load_account_db().get_project_run(project_id, run_id, token)
-    except RuntimeError as exc:
+    except Exception as exc:
         if "not found" in str(exc).lower() or "sign in" in str(exc).lower():
             st.session_state.active_run_id = None
             st.session_state.active_run_project = None
