@@ -99,7 +99,7 @@ def run_cycle(
         log("========================================")
         log("Discovery engine v17")
         log("This run checks each shop on its own domain. A myshopify.com name is not checked and is not saved.")
-        log("Several websites are checked at the same time.")
+        log("Each website is checked, then the activity log moves to the next one.")
         log("A password page is checked again on a later run. It is not published until the shop opens.")
         log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
@@ -168,7 +168,6 @@ def run_cycle(
 
             if min(config.CHECK_WORKERS, len(pending)) <= 1:
                 for candidate, index in pending:
-                    lines: list[str] = []
                     try:
                         counted = _process_candidate(
                             connection,
@@ -176,18 +175,18 @@ def run_cycle(
                             index,
                             max_domains,
                             stats,
-                            lines.append,
+                            log,
                             countries,
                             keep_unknown,
                         )
                     except Exception as exc:
-                        lines.append(f"  Error on {candidate.domain}: {exc}")
+                        log(f"  Error on {candidate.domain}: {exc}")
                         try:
                             mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
                         except Exception:
                             pass
                         counted = True
-                    finish_one(counted, lines)
+                    finish_one(counted, [])
                 return
 
             def quiet(candidate, index: int):

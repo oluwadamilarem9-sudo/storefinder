@@ -19,7 +19,7 @@ REQUEST_DELAY = 0.2
 REQUEST_TIMEOUT = 5
 
 # How many different websites to open at the same time during one cycle.
-CHECK_WORKERS = 6
+CHECK_WORKERS = 1
 
 # How many discovery cycles this machine runs at the same time.
 # Each extra computer that runs worker.py adds this many more cycles.

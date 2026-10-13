@@ -7,7 +7,7 @@ We never try to evade a robots rule.
 
 from __future__ import annotations
 
-from threading import Lock
+from threading import Lock, Thread
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 from urllib.request import Request, urlopen
@@ -47,14 +47,33 @@ def _parser_for(url: str) -> RobotFileParser | None:
     robots_url = origin + "/robots.txt"
     parser = RobotFileParser()
     parser.set_url(robots_url)
-    try:
-        request = Request(robots_url, headers={"User-Agent": USER_AGENT})
-        with urlopen(request, timeout=_ROBOTS_TIMEOUT) as response:
-            raw = response.read(200_000).decode("utf-8", errors="ignore")
-        parser.parse(raw.splitlines())
-        stored = parser
-    except Exception:
+    raw = _read_robots(robots_url)
+    if raw is None:
         stored = None
+    else:
+        try:
+            parser.parse(raw.splitlines())
+            stored = parser
+        except Exception:
+            stored = None
     with _CACHE_LOCK:
         _CACHE[origin] = stored
     return stored
+
+
+def _read_robots(robots_url: str) -> str | None:
+    """Read robots.txt, and give up if the site does not answer."""
+    box: dict[str, str] = {}
+
+    def download() -> None:
+        try:
+            request = Request(robots_url, headers={"User-Agent": USER_AGENT})
+            with urlopen(request, timeout=_ROBOTS_TIMEOUT) as response:
+                box["raw"] = response.read(200_000).decode("utf-8", errors="ignore")
+        except Exception:
+            return
+
+    thread = Thread(target=download, daemon=True)
+    thread.start()
+    thread.join(_ROBOTS_TIMEOUT + 1)
+    return box.get("raw")
