@@ -102,10 +102,26 @@ def database_url() -> str:
         scheme, rest = url.split("://", 1)
         if scheme in {"postgres", "postgresql", "postgresql+psycopg", "postgresql+psycopg2"}:
             url = "postgresql+psycopg2://" + rest
+    url = _transaction_pooler(url)
     if url.startswith("postgresql") and "sslmode" not in url:
         join = "&" if "?" in url else "?"
         url = f"{url}{join}sslmode=require"
     return url
+
+
+def _transaction_pooler(url: str) -> str:
+    """Use the pooler's transaction port. Session mode refuses a 16th client."""
+    if "pooler.supabase.com" not in url or "@" not in url or "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    userinfo, hostpart = rest.rsplit("@", 1)
+    host_only = hostpart.split("/")[0].split("?")[0]
+    if ":5432" not in host_only:
+        return url
+    hostname = host_only.replace(":5432", "", 1)
+    if not hostname.endswith("pooler.supabase.com"):
+        return url
+    return f"{scheme}://{userinfo}@{hostpart.replace(':5432', ':6543', 1)}"
 
 
 def using_database() -> bool:
