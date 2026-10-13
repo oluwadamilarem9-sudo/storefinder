@@ -22,6 +22,7 @@ from sqlalchemy.pool import NullPool
 Base = declarative_base()
 _engine = None
 _Session = None
+_ACCOUNT_DB_GENERATION = 3
 
 
 class User(Base):
@@ -116,12 +117,18 @@ def _transaction_pooler(url: str) -> str:
     scheme, rest = url.split("://", 1)
     userinfo, hostpart = rest.rsplit("@", 1)
     host_only = hostpart.split("/")[0].split("?")[0]
-    if ":5432" not in host_only:
-        return url
-    hostname = host_only.replace(":5432", "", 1)
+    hostname = host_only
+    if hostname.count(":") == 1 and not hostname.startswith("["):
+        hostname = hostname.rsplit(":", 1)[0]
     if not hostname.endswith("pooler.supabase.com"):
         return url
-    return f"{scheme}://{userinfo}@{hostpart.replace(':5432', ':6543', 1)}"
+    if host_only.endswith(":6543"):
+        return url
+    if ":5432" in host_only:
+        hostpart = hostpart.replace(":5432", ":6543", 1)
+    else:
+        hostpart = hostpart.replace(hostname, hostname + ":6543", 1)
+    return f"{scheme}://{userinfo}@{hostpart}"
 
 
 def using_database() -> bool:

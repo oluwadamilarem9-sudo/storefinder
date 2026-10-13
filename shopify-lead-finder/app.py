@@ -68,12 +68,18 @@ st.set_page_config(
 
 
 def _load_account_db():
-    """Use account storage. Reload once if this process still has the old module."""
+    """Load account storage and drop any old connection pool this process still holds."""
     import importlib
 
     import account_db
 
-    if not hasattr(account_db, "get_project_run") or not hasattr(account_db, "latest_open_run"):
+    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 3:
+        engine = getattr(account_db, "_engine", None)
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
         account_db = importlib.reload(account_db)
     return account_db
 

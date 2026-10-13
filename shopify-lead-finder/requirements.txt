@@ -6,3 +6,4 @@ extra-streamlit-components>=0.1.81
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.9
 bcrypt>=4.1.2
+# Account sign-in uses a short-lived database connection.
