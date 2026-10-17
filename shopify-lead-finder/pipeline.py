@@ -92,12 +92,13 @@ def run_cycle(
         "this_run_rejected_domains": [],
     }
 
+    log("Opening this project's store list.")
     connection = connect(db_path)
     try:
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v17")
+        log("Discovery engine v18")
         log("This run checks each shop on its own domain. A myshopify.com name is not checked and is not saved.")
         log("Each website is checked, then the activity log moves to the next one.")
         log("A password page is checked again on a later run. It is not published until the shop opens.")

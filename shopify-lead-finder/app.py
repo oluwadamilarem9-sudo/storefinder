@@ -73,7 +73,7 @@ def _load_account_db():
 
     import account_db
 
-    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 3:
+    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 4:
         engine = getattr(account_db, "_engine", None)
         if engine is not None:
             try:
@@ -424,10 +424,10 @@ with st.sidebar:
     max_domains = st.number_input(
         "Max websites to check",
         min_value=5,
-        max_value=10000,
-        value=min(int(MAX_DOMAINS_PER_CYCLE), 10000),
+        max_value=100,
+        value=min(int(MAX_DOMAINS_PER_CYCLE), 100),
         step=5,
-        help="The run visits this many websites. It does not stop when the first lead is saved.",
+        help="The run visits this many websites on this page. Keep it at 100 or less so the cycle can finish. It does not stop when the first lead is saved.",
     )
     enable_secondary = st.checkbox(
         "Include extra sources (Wayback, Hacker News)",
@@ -498,13 +498,27 @@ if run_clicked:
         st.warning("Please sign in and create/select a project before running discovery.")
         st.stop()
 
+    check_limit = min(int(max_domains), 100)
     log_box = st.empty()
     logs: list[str] = ["Cycle started. Searching public sources for shops on their own domain."]
     log_box.code("\n".join(logs[-40:]), language="text")
+    last_log_flush = {"at": 0.0, "count": 0}
 
     def on_log(message: str) -> None:
         logs.append(message)
         log_box.code("\n".join(logs[-40:]), language="text")
+        run_id = st.session_state.get("backend_run_id")
+        if not run_id:
+            return
+        now = time.monotonic()
+        if now - last_log_flush["at"] < 2 and len(logs) - last_log_flush["count"] < 5:
+            return
+        last_log_flush["at"] = now
+        last_log_flush["count"] = len(logs)
+        try:
+            _load_account_db().save_run_log(str(run_id), "\n".join(logs[-80:]))
+        except Exception:
+            pass
 
     st.session_state.active_run_id = None
     st.session_state.active_run_project = None
@@ -527,10 +541,10 @@ if run_clicked:
                 method="POST",
                 payload={
                     "name": f"Discovery run {len(logs)}",
-                    "max_domains": int(max_domains),
+                    "max_domains": check_limit,
                     "on_page": True,
                     "settings": {
-                        "max_domains": int(max_domains),
+                        "max_domains": check_limit,
                         "enable_secondary": bool(enable_secondary),
                         "target_countries": [] if all_countries else list(selected_country_codes),
                         "keep_unknown_country": bool(keep_unknown_country),
@@ -547,18 +561,42 @@ if run_clicked:
         st.session_state.backend_run_id = None
         st.stop()
 
-    with st.spinner("Searching public sources and checking websites..."):
-        run_cycle = _load_run_cycle()
-        result = run_cycle(
-            on_log=on_log,
-            max_domains=max_domains,
-            enable_secondary=enable_secondary,
-            target_countries=[] if all_countries else selected_country_codes,
-            keep_unknown_country=keep_unknown_country,
-            db_path=storage["db"],
-            leads_csv=storage["leads_csv"],
-            rejected_csv=storage["rejected_csv"],
+    result = None
+    try:
+        with st.spinner("Searching public sources and checking websites..."):
+            run_cycle = _load_run_cycle()
+            result = run_cycle(
+                on_log=on_log,
+                max_domains=check_limit,
+                enable_secondary=enable_secondary,
+                target_countries=[] if all_countries else selected_country_codes,
+                keep_unknown_country=keep_unknown_country,
+                db_path=storage["db"],
+                leads_csv=storage["leads_csv"],
+                rejected_csv=storage["rejected_csv"],
+            )
+    except Exception as exc:
+        on_log(f"Discovery stopped: {exc}")
+        run_id = st.session_state.get("backend_run_id")
+        if run_id:
+            try:
+                _load_account_db().finish_run(
+                    str(run_id),
+                    status="failed",
+                    summary="Discovery stopped before it finished.",
+                    result={},
+                    error=str(exc),
+                )
+            except Exception:
+                pass
+        st.session_state.logs = logs
+        st.session_state.flash_kind = "warning"
+        st.session_state.flash = (
+            "Discovery did not complete. The cycle stopped before websites finished checking. "
+            "Open the Activity log."
         )
+        st.rerun()
+
     st.session_state.logs = logs
     st.session_state.last_stats = result
     st.session_state.this_run_lead_domains = list(result.get("this_run_lead_domains") or [])

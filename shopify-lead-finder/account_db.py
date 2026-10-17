@@ -22,7 +22,7 @@ from sqlalchemy.pool import NullPool
 Base = declarative_base()
 _engine = None
 _Session = None
-_ACCOUNT_DB_GENERATION = 3
+_ACCOUNT_DB_GENERATION = 4
 
 
 class User(Base):
@@ -268,15 +268,31 @@ def _route(session, path: str, method: str, payload: dict, token: str):
     if run_match and method == "POST":
         user = _require_user(session, token)
         project = _owned_project(session, user.id, run_match.group(1))
+        # A new click replaces any cycle that sat open without finishing.
+        open_rows = (
+            session.query(DiscoveryRun)
+            .filter(
+                DiscoveryRun.project_id == project.id,
+                DiscoveryRun.user_id == user.id,
+                DiscoveryRun.status.in_(("queued", "running")),
+            )
+            .all()
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        for old in open_rows:
+            old.status = "failed"
+            old.error = "Replaced by a new discovery cycle."
+            old.touched_at = now
+        max_domains = min(max(int(payload.get("max_domains") or 20), 1), 100)
         run = DiscoveryRun(
             project_id=project.id,
             user_id=user.id,
             name=payload.get("name") or "Discovery run",
-            max_domains=int(payload.get("max_domains") or 20),
+            max_domains=max_domains,
             status="running" if payload.get("on_page") else "queued",
             settings_json=json.dumps(payload.get("settings") or {}),
             log_text="Cycle started. Searching public sources for shops on their own domain.",
-            touched_at=datetime.now(timezone.utc).isoformat(),
+            touched_at=now,
         )
         session.add(run)
         session.commit()
@@ -439,19 +455,19 @@ def _stamp(value) -> datetime | None:
 
 
 def _reclaim_stale_runs(session) -> None:
-    """Put a cycle back in the queue when its worker stopped without finishing."""
+    """Close a cycle that sat with no progress instead of leaving it forever."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=3)
     rows = session.query(DiscoveryRun).filter(DiscoveryRun.status == "running").all()
     changed = False
+    now = datetime.now(timezone.utc).isoformat()
     for run in rows:
-        if not str(run.touched_at or "").strip():
-            run.status = "queued"
-            changed = True
-            continue
         stamp = _stamp(run.touched_at)
-        if stamp is None or stamp < cutoff:
-            run.status = "queued"
-            changed = True
+        if stamp is not None and stamp >= cutoff:
+            continue
+        run.status = "failed"
+        run.error = "Cycle stopped because it sat with no progress."
+        run.touched_at = now
+        changed = True
     if changed:
         session.commit()
 

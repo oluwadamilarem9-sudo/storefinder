@@ -29,6 +29,8 @@ _SESSION_HEADERS = {
 _THREAD_STATE = local()
 _HOST_LOCK = Lock()
 _NEXT_REQUEST_AT: dict[str, float] = {}
+_DNS_OK: dict[str, float] = {}
+_DNS_LOCK = Lock()
 
 
 def _session() -> requests.Session:
@@ -249,17 +251,28 @@ def _host_answers(url: str, seconds: float) -> bool:
     host = urlparse(url).hostname
     if not host:
         return False
+    with _DNS_LOCK:
+        cached = _DNS_OK.get(host)
+        if cached and time.monotonic() - cached < 600:
+            return True
     done = Event()
+    ok = {"value": False}
 
     def lookup() -> None:
         try:
             socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            ok["value"] = True
         except Exception:
-            pass
+            ok["value"] = False
         done.set()
 
     Thread(target=lookup, daemon=True).start()
-    return done.wait(max(seconds, 1.0))
+    if not done.wait(max(seconds, 1.0)):
+        return False
+    if ok["value"]:
+        with _DNS_LOCK:
+            _DNS_OK[host] = time.monotonic()
+    return ok["value"]
 
 
 def public_origin(url: str) -> str:
