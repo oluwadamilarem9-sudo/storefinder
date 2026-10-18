@@ -60,6 +60,7 @@ def run_cycle(
     db_path=None,
     leads_csv=None,
     rejected_csv=None,
+    durable_sink=None,
 ) -> dict:
     """
     Run one automatic discovery cycle.
@@ -183,6 +184,11 @@ def run_cycle(
                 with abandoned_lock:
                     return domain in abandoned_domains
 
+            if durable_sink is not None and getattr(durable_sink, "is_abandoned", None) is None:
+                durable_sink.is_abandoned = is_cancelled
+            elif durable_sink is not None:
+                durable_sink.is_abandoned = is_cancelled
+
             def quiet(candidate, index: int):
                 lines: list[str] = []
                 if is_cancelled(candidate.domain):
@@ -200,6 +206,7 @@ def run_cycle(
                             countries,
                             keep_unknown,
                             is_cancelled=lambda: is_cancelled(candidate.domain),
+                            durable_sink=durable_sink,
                         )
                     except Exception as exc:
                         if is_cancelled(candidate.domain):
@@ -249,6 +256,11 @@ def run_cycle(
                             [line for line in lines if "] Checking " not in line],
                         )
                         beat()
+                        if durable_sink is not None:
+                            try:
+                                durable_sink.maybe_flush_on_heartbeat()
+                            except Exception:
+                                pass
                     now = time.monotonic()
                     timed_out = [
                         future
@@ -270,10 +282,26 @@ def run_cycle(
                             )
                         except Exception:
                             pass
+                        if durable_sink is not None:
+                            try:
+                                durable_sink.record_processed(
+                                    {
+                                        "domain": candidate.domain,
+                                        "shopify_status": "UNKNOWN",
+                                        "discovery_source": candidate.source,
+                                    }
+                                )
+                            except Exception:
+                                pass
                         finish_one(True, [])
                         beat()
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
+            if durable_sink is not None:
+                try:
+                    durable_sink.flush()
+                except Exception:
+                    pass
 
         if watching:
             log(f"Rechecking {len(watching)} shop(s) still behind a password page.")
@@ -354,6 +382,7 @@ def _process_candidate(
     countries: list[str],
     keep_unknown: bool,
     is_cancelled: Callable[[], bool] | None = None,
+    durable_sink=None,
 ) -> bool:
     domain = candidate.domain
     log(f"[{index}/{total}] Checking {domain}")
@@ -376,6 +405,7 @@ def _process_candidate(
             return False
         log(f"  Status: skipped ({homepage.error})")
         mark_processed(connection, domain, "UNKNOWN", candidate.source)
+        _durable_processed(durable_sink, domain, "UNKNOWN", candidate.source)
         return True
 
     final_domain = normalize_domain(homepage.final_url or domain)
@@ -384,18 +414,17 @@ def _process_candidate(
             log(f"  Status: skipped (abandoned) on {domain}")
             return True
         log("  Status: rejected (demo, test, or platform host)")
-        upsert_rejected(
-            connection,
-            {
-                "domain": final_domain or domain,
-                "shopify_status": "UNKNOWN",
-                "discovery_source": candidate.source,
-                "source_url": candidate.source_url,
-                "freshness_level": "LOW",
-                "freshness_evidence": "Filtered as a demo, test, example, or platform host.",
-                "reject_reason": "filtered_demo_or_test_store",
-            },
-        )
+        rejected_row = {
+            "domain": final_domain or domain,
+            "shopify_status": "UNKNOWN",
+            "discovery_source": candidate.source,
+            "source_url": candidate.source_url,
+            "freshness_level": "LOW",
+            "freshness_evidence": "Filtered as a demo, test, example, or platform host.",
+            "reject_reason": "filtered_demo_or_test_store",
+        }
+        upsert_rejected(connection, rejected_row)
+        _durable_rejected(durable_sink, rejected_row)
         _append_stat(stats, "this_run_rejected_domains", final_domain or domain)
         return True
 
@@ -407,8 +436,10 @@ def _process_candidate(
 
     if shopify_status != "SHOPIFY":
         mark_processed(connection, final_domain, shopify_status, candidate.source)
+        _durable_processed(durable_sink, final_domain, shopify_status, candidate.source)
         if final_domain != domain:
             mark_processed(connection, domain, shopify_status, candidate.source)
+            _durable_processed(durable_sink, domain, shopify_status, candidate.source)
         log("  Status: discarded")
         return True
 
@@ -442,6 +473,7 @@ def _process_candidate(
             evidence="The shop has not published a domain of its own. A myshopify.com name is not saved.",
             log=log,
             status="rejected (no custom domain)",
+            durable_sink=durable_sink,
         )
         return True
 
@@ -461,6 +493,7 @@ def _process_candidate(
             evidence="The public page is a password wall or an opening-soon page.",
             log=log,
             status="watching (password page, checked again next run)",
+            durable_sink=durable_sink,
         )
         return True
 
@@ -481,6 +514,7 @@ def _process_candidate(
             evidence=profile.evidence(),
             log=log,
             status="watching (password page, checked again next run)",
+            durable_sink=durable_sink,
         )
         return True
     if not profile.product_names:
@@ -499,6 +533,7 @@ def _process_candidate(
             evidence=profile.evidence(),
             log=log,
             status="rejected (no public products)",
+            durable_sink=durable_sink,
         )
         return True
 
@@ -538,6 +573,7 @@ def _process_candidate(
                 ),
                 log=log,
                 status=status,
+                durable_sink=durable_sink,
             )
             return True
 
@@ -562,6 +598,7 @@ def _process_candidate(
     else:
         log("  Email: not published on the store")
     upsert_lead(connection, record)
+    _durable_lead(durable_sink, record)
     clear_password_watch(connection, final_domain)
     if domain != final_domain:
         clear_password_watch(connection, domain)
@@ -570,10 +607,56 @@ def _process_candidate(
 
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
+        _durable_processed(durable_sink, domain, "SHOPIFY", candidate.source)
     return True
 
 
-def _reject(connection, stats, domain, final_domain, candidate, contacts, reason, evidence, log, status) -> None:
+def _durable_lead(sink, record: dict) -> None:
+    if sink is None:
+        return
+    try:
+        sink.record_lead(record)
+    except Exception:
+        pass
+
+
+def _durable_rejected(sink, record: dict) -> None:
+    if sink is None:
+        return
+    try:
+        sink.record_rejected(record)
+    except Exception:
+        pass
+
+
+def _durable_processed(sink, domain: str, shopify_status: str, discovery_source: str) -> None:
+    if sink is None:
+        return
+    try:
+        sink.record_processed(
+            {
+                "domain": domain,
+                "shopify_status": shopify_status,
+                "discovery_source": discovery_source,
+            }
+        )
+    except Exception:
+        pass
+
+
+def _reject(
+    connection,
+    stats,
+    domain,
+    final_domain,
+    candidate,
+    contacts,
+    reason,
+    evidence,
+    log,
+    status,
+    durable_sink=None,
+) -> None:
     record = {
         **contacts,
         "domain": final_domain,
@@ -589,8 +672,10 @@ def _reject(connection, stats, domain, final_domain, candidate, contacts, reason
     log(f"  Status: {status}")
     _append_stat(stats, "this_run_rejected_domains", final_domain)
     upsert_rejected(connection, record)
+    _durable_rejected(durable_sink, record)
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
+        _durable_processed(durable_sink, domain, "SHOPIFY", candidate.source)
 
 
 def _qualifying_count(stats: dict) -> int:

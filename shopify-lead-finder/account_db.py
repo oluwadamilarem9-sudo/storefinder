@@ -15,14 +15,23 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    text,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import NullPool
 
 Base = declarative_base()
 _engine = None
 _Session = None
-_ACCOUNT_DB_GENERATION = 7
+_ACCOUNT_DB_GENERATION = 8
 
 
 class User(Base):
@@ -61,6 +70,8 @@ class DiscoveryRun(Base):
 
 class Lead(Base):
     __tablename__ = "leads"
+    # UNIQUE(project_id, domain) is added by scripts/phase_c_add_unique_indexes.py
+    # after dedupe — not here — so production-like scratch restores with duplicates can migrate.
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     project_id = Column(String, ForeignKey("projects.id"), nullable=False)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
@@ -71,7 +82,19 @@ class Lead(Base):
     country = Column(String, nullable=True)
     freshness_level = Column(String, nullable=True)
     freshness_score = Column(Integer, nullable=True)
+    freshness_evidence = Column(Text, nullable=True)
     source = Column(String, nullable=True)
+    source_url = Column(String, nullable=True)
+    shopify_status = Column(String, nullable=True)
+    contact_page = Column(String, nullable=True)
+    about_page = Column(String, nullable=True)
+    instagram = Column(String, nullable=True)
+    facebook = Column(String, nullable=True)
+    tiktok = Column(String, nullable=True)
+    linkedin = Column(String, nullable=True)
+    first_seen = Column(String, nullable=True)
+    last_checked = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -85,6 +108,29 @@ class RejectedCandidate(Base):
     store_name = Column(String, nullable=True)
     public_email = Column(String, nullable=True)
     reason = Column(String, nullable=True)
+    freshness_level = Column(String, nullable=True)
+    freshness_score = Column(Integer, nullable=True)
+    freshness_evidence = Column(Text, nullable=True)
+    source = Column(String, nullable=True)
+    source_url = Column(String, nullable=True)
+    shopify_status = Column(String, nullable=True)
+    first_seen = Column(String, nullable=True)
+    last_checked = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ProcessedDomain(Base):
+    __tablename__ = "processed_domains"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    domain = Column(String, nullable=False)
+    first_seen = Column(String, nullable=True)
+    last_checked = Column(String, nullable=True)
+    shopify_status = Column(String, nullable=True)
+    discovery_source = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -194,6 +240,7 @@ def _session(url: str):
                 engine = create_engine(url, **kwargs)
                 Base.metadata.create_all(bind=engine)
                 _ensure_run_columns(engine)
+                _ensure_phase_c_columns(engine)
                 _engine = engine
                 _Session = sessionmaker(bind=engine)
     if not _DB_SLOTS.acquire(timeout=12):
@@ -262,6 +309,106 @@ def _ensure_run_columns(engine) -> None:
                     if "duplicate column" in message or "already exists" in message:
                         continue
                     raise
+
+
+_PHASE_C_LEAD_COLUMNS = {
+    "freshness_evidence": "TEXT",
+    "source_url": "TEXT",
+    "shopify_status": "TEXT",
+    "contact_page": "TEXT",
+    "about_page": "TEXT",
+    "instagram": "TEXT",
+    "facebook": "TEXT",
+    "tiktok": "TEXT",
+    "linkedin": "TEXT",
+    "first_seen": "TEXT",
+    "last_checked": "TEXT",
+    "updated_at": "TIMESTAMP",
+}
+
+_PHASE_C_REJECTED_COLUMNS = {
+    "freshness_level": "TEXT",
+    "freshness_score": "INTEGER",
+    "freshness_evidence": "TEXT",
+    "source": "TEXT",
+    "source_url": "TEXT",
+    "shopify_status": "TEXT",
+    "first_seen": "TEXT",
+    "last_checked": "TEXT",
+    "updated_at": "TIMESTAMP",
+}
+
+
+def _ensure_phase_c_columns(engine) -> None:
+    """Additive Phase C columns and processed_domains table. No unique indexes here."""
+    from sqlalchemy import inspect
+
+    is_postgres = engine.dialect.name == "postgresql"
+    with _SCHEMA_LOCK:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        with engine.begin() as connection:
+            if "processed_domains" not in tables:
+                if is_postgres:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS processed_domains (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL REFERENCES projects(id),
+                                user_id TEXT NOT NULL REFERENCES users(id),
+                                domain TEXT NOT NULL,
+                                first_seen TEXT,
+                                last_checked TEXT,
+                                shopify_status TEXT,
+                                discovery_source TEXT,
+                                updated_at TIMESTAMP,
+                                created_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS processed_domains (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL,
+                                user_id TEXT NOT NULL,
+                                domain TEXT NOT NULL,
+                                first_seen TEXT,
+                                last_checked TEXT,
+                                shopify_status TEXT,
+                                discovery_source TEXT,
+                                updated_at TIMESTAMP,
+                                created_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+            for table, extras in (
+                ("leads", _PHASE_C_LEAD_COLUMNS),
+                ("rejected_candidates", _PHASE_C_REJECTED_COLUMNS),
+            ):
+                try:
+                    existing = {column["name"] for column in inspector.get_columns(table)}
+                except Exception:
+                    continue
+                for name, typ in extras.items():
+                    if name in existing:
+                        continue
+                    if is_postgres:
+                        statement = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {typ}"
+                    else:
+                        statement = f"ALTER TABLE {table} ADD COLUMN {name} {typ}"
+                    try:
+                        connection.execute(text(statement))
+                    except Exception as exc:
+                        message = str(exc).lower()
+                        if "duplicate column" in message or "already exists" in message:
+                            continue
+                        raise
 
 
 def _route(session, path: str, method: str, payload: dict, token: str):
@@ -350,19 +497,7 @@ def _route(session, path: str, method: str, payload: dict, token: str):
     if lead_match and method == "POST":
         user = _require_user(session, token)
         project = _owned_project(session, user.id, lead_match.group(1))
-        lead = Lead(
-            project_id=project.id,
-            user_id=user.id,
-            run_id=payload.get("run_id"),
-            domain=str(payload.get("domain") or ""),
-            store_name=payload.get("store_name"),
-            public_email=payload.get("public_email"),
-            country=payload.get("country"),
-            freshness_level=payload.get("freshness_level"),
-            freshness_score=payload.get("freshness_score"),
-            source=payload.get("source"),
-        )
-        session.add(lead)
+        lead = _upsert_lead_row(session, project.id, user.id, payload)
         session.commit()
         return {"id": lead.id, "domain": lead.domain}
     rejected_match = re.fullmatch(r"/projects/([^/]+)/rejected", path)
@@ -378,16 +513,7 @@ def _route(session, path: str, method: str, payload: dict, token: str):
     if rejected_match and method == "POST":
         user = _require_user(session, token)
         project = _owned_project(session, user.id, rejected_match.group(1))
-        row = RejectedCandidate(
-            project_id=project.id,
-            user_id=user.id,
-            run_id=payload.get("run_id"),
-            domain=str(payload.get("domain") or ""),
-            store_name=payload.get("store_name"),
-            public_email=payload.get("public_email"),
-            reason=payload.get("reason"),
-        )
-        session.add(row)
+        row = _upsert_rejected_row(session, project.id, user.id, payload)
         session.commit()
         return {"id": row.id, "domain": row.domain}
     raise RuntimeError(f"Unsupported account request: {method} {path}")
@@ -721,17 +847,27 @@ def _job_dict(run: DiscoveryRun) -> dict:
     }
 
 
-def project_history(project_id: str) -> tuple[list[str], list[dict]]:
+def project_history(project_id: str, user_id: str | None = None) -> tuple[list[str], list[dict]]:
     """Domains already saved for a project, plus password-page rows to watch again."""
     url = database_url()
     if not url:
         return [], []
     session = _session(url)
     try:
-        leads = [row.domain for row in session.query(Lead).filter(Lead.project_id == project_id).all() if row.domain]
+        if user_id:
+            _owned_project(session, user_id, project_id)
+            lead_q = session.query(Lead).filter(Lead.project_id == project_id, Lead.user_id == user_id)
+            rejected_q = session.query(RejectedCandidate).filter(
+                RejectedCandidate.project_id == project_id,
+                RejectedCandidate.user_id == user_id,
+            )
+        else:
+            lead_q = session.query(Lead).filter(Lead.project_id == project_id)
+            rejected_q = session.query(RejectedCandidate).filter(RejectedCandidate.project_id == project_id)
+        leads = [row.domain for row in lead_q.all() if row.domain]
         rejected = [
             {"domain": row.domain, "reason": row.reason or ""}
-            for row in session.query(RejectedCandidate).filter(RejectedCandidate.project_id == project_id).all()
+            for row in rejected_q.all()
             if row.domain
         ]
         return leads, rejected
@@ -740,60 +876,155 @@ def project_history(project_id: str) -> tuple[list[str], list[dict]]:
 
 
 def store_run_rows(project_id: str, user_id: str, run_id: str, leads: list[dict], rejected: list[dict]) -> None:
-    """Copy this cycle's new rows into the shared account database."""
+    """Copy this cycle's new rows into the shared account database (batched upsert)."""
+    flush_durable_batch(project_id, user_id, run_id, leads, rejected, processed=[])
+
+
+def flush_durable_batch(
+    project_id: str,
+    user_id: str,
+    run_id: str,
+    leads: list[dict],
+    rejected: list[dict],
+    processed: list[dict] | None = None,
+) -> None:
+    """Upsert a batch of durable rows. Verifies project ownership and run ownership."""
     url = database_url()
     if not url:
         return
     session = _session(url)
     try:
-        known_leads = {
-            row.domain
-            for row in session.query(Lead).filter(Lead.project_id == project_id).all()
-            if row.domain
-        }
-        known_rejected = {
-            row.domain
-            for row in session.query(RejectedCandidate).filter(RejectedCandidate.project_id == project_id).all()
-            if row.domain
-        }
-        for item in leads:
-            domain = str(item.get("domain") or "")
-            if not domain or domain in known_leads:
-                continue
-            session.add(
-                Lead(
-                    project_id=project_id,
-                    user_id=user_id,
-                    run_id=run_id,
-                    domain=domain,
-                    store_name=item.get("store_name"),
-                    public_email=item.get("public_email"),
-                    country=item.get("country"),
-                    freshness_level=item.get("freshness_level"),
-                    freshness_score=item.get("freshness_score"),
-                    source=item.get("source"),
-                )
-            )
-            known_leads.add(domain)
-        for item in rejected:
-            domain = str(item.get("domain") or "")
-            if not domain or domain in known_rejected or domain in known_leads:
-                continue
-            session.add(
-                RejectedCandidate(
-                    project_id=project_id,
-                    user_id=user_id,
-                    run_id=run_id,
-                    domain=domain,
-                    store_name=item.get("store_name"),
-                    public_email=item.get("public_email"),
-                    reason=item.get("reason"),
-                )
-            )
-            known_rejected.add(domain)
+        project = _owned_project(session, user_id, project_id)
+        if run_id:
+            run = session.get(DiscoveryRun, run_id)
+            if run is None or run.project_id != project.id or run.user_id != user_id:
+                raise RuntimeError("Run not found or not owned by this user")
+        for item in leads or []:
+            payload = dict(item)
+            payload["run_id"] = payload.get("run_id") or run_id
+            _upsert_lead_row(session, project.id, user_id, payload)
+        for item in rejected or []:
+            payload = dict(item)
+            payload["run_id"] = payload.get("run_id") or run_id
+            if "reason" not in payload and payload.get("reject_reason"):
+                payload["reason"] = payload.get("reject_reason")
+            _upsert_rejected_row(session, project.id, user_id, payload)
+        for item in processed or []:
+            _upsert_processed_row(session, project.id, user_id, item)
         session.commit()
     finally:
         session.close()
+
+
+def _prefer(existing, incoming):
+    if incoming is None:
+        return existing
+    if isinstance(incoming, (int, float)):
+        return incoming
+    text_value = str(incoming).strip()
+    if not text_value:
+        return existing
+    return incoming
+
+
+def _upsert_lead_row(session, project_id: str, user_id: str, payload: dict) -> Lead:
+    domain = str(payload.get("domain") or "").strip()
+    if not domain:
+        raise RuntimeError("domain is required")
+    now = datetime.now(timezone.utc)
+    row = (
+        session.query(Lead)
+        .filter(Lead.project_id == project_id, Lead.user_id == user_id, Lead.domain == domain)
+        .first()
+    )
+    if row is None:
+        row = Lead(project_id=project_id, user_id=user_id, domain=domain)
+        session.add(row)
+        row.first_seen = payload.get("first_seen") or now.isoformat()
+    row.run_id = _prefer(row.run_id, payload.get("run_id"))
+    row.store_name = _prefer(row.store_name, payload.get("store_name"))
+    row.public_email = _prefer(row.public_email, payload.get("public_email"))
+    row.country = _prefer(row.country, payload.get("country"))
+    row.freshness_level = _prefer(row.freshness_level, payload.get("freshness_level"))
+    score = payload.get("freshness_score")
+    if score is not None:
+        row.freshness_score = int(score or 0)
+    row.freshness_evidence = _prefer(row.freshness_evidence, payload.get("freshness_evidence"))
+    row.source = _prefer(row.source, payload.get("source") or payload.get("discovery_source"))
+    row.source_url = _prefer(row.source_url, payload.get("source_url"))
+    row.shopify_status = _prefer(row.shopify_status, payload.get("shopify_status"))
+    row.contact_page = _prefer(row.contact_page, payload.get("contact_page"))
+    row.about_page = _prefer(row.about_page, payload.get("about_page"))
+    row.instagram = _prefer(row.instagram, payload.get("instagram"))
+    row.facebook = _prefer(row.facebook, payload.get("facebook"))
+    row.tiktok = _prefer(row.tiktok, payload.get("tiktok"))
+    row.linkedin = _prefer(row.linkedin, payload.get("linkedin"))
+    row.last_checked = payload.get("last_checked") or now.isoformat()
+    row.updated_at = now
+    return row
+
+
+def _upsert_rejected_row(session, project_id: str, user_id: str, payload: dict) -> RejectedCandidate:
+    domain = str(payload.get("domain") or "").strip()
+    if not domain:
+        raise RuntimeError("domain is required")
+    now = datetime.now(timezone.utc)
+    row = (
+        session.query(RejectedCandidate)
+        .filter(
+            RejectedCandidate.project_id == project_id,
+            RejectedCandidate.user_id == user_id,
+            RejectedCandidate.domain == domain,
+        )
+        .first()
+    )
+    if row is None:
+        row = RejectedCandidate(project_id=project_id, user_id=user_id, domain=domain)
+        session.add(row)
+        row.first_seen = payload.get("first_seen") or now.isoformat()
+    row.run_id = _prefer(row.run_id, payload.get("run_id"))
+    row.store_name = _prefer(row.store_name, payload.get("store_name"))
+    row.public_email = _prefer(row.public_email, payload.get("public_email"))
+    row.reason = _prefer(row.reason, payload.get("reason") or payload.get("reject_reason"))
+    row.freshness_level = _prefer(row.freshness_level, payload.get("freshness_level"))
+    score = payload.get("freshness_score")
+    if score is not None:
+        row.freshness_score = int(score or 0)
+    row.freshness_evidence = _prefer(row.freshness_evidence, payload.get("freshness_evidence"))
+    row.source = _prefer(row.source, payload.get("source") or payload.get("discovery_source"))
+    row.source_url = _prefer(row.source_url, payload.get("source_url"))
+    row.shopify_status = _prefer(row.shopify_status, payload.get("shopify_status"))
+    row.last_checked = payload.get("last_checked") or now.isoformat()
+    row.updated_at = now
+    return row
+
+
+def _upsert_processed_row(session, project_id: str, user_id: str, payload: dict) -> ProcessedDomain:
+    domain = str(payload.get("domain") or "").strip()
+    if not domain:
+        raise RuntimeError("domain is required")
+    now = datetime.now(timezone.utc)
+    row = (
+        session.query(ProcessedDomain)
+        .filter(
+            ProcessedDomain.project_id == project_id,
+            ProcessedDomain.user_id == user_id,
+            ProcessedDomain.domain == domain,
+        )
+        .first()
+    )
+    if row is None:
+        row = ProcessedDomain(project_id=project_id, user_id=user_id, domain=domain)
+        session.add(row)
+        row.first_seen = payload.get("first_seen") or now.isoformat()
+    row.last_checked = payload.get("last_checked") or now.isoformat()
+    row.shopify_status = _prefer(row.shopify_status, payload.get("shopify_status"))
+    row.discovery_source = _prefer(
+        row.discovery_source,
+        payload.get("discovery_source") or payload.get("source"),
+    )
+    row.updated_at = now
+    return row
 
 
 def _signup(session, payload: dict):

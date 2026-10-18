@@ -202,7 +202,18 @@ def test_abandoned_domain_skips_late_writes(tmp_path, monkeypatch):
     gate = threading.Event()
     started = threading.Event()
 
-    def slow_process(connection, candidate, index, total, stats, log, countries, keep_unknown, is_cancelled=None):
+    def slow_process(
+        connection,
+        candidate,
+        index,
+        total,
+        stats,
+        log,
+        countries,
+        keep_unknown,
+        is_cancelled=None,
+        durable_sink=None,
+    ):
         started.set()
         gate.wait(3)
         if is_cancelled and is_cancelled():

@@ -33,6 +33,26 @@ RUN_STALE_MINUTES = int(os.environ.get("RUN_STALE_MINUTES") or "20")
 # How often the on-page cycle may refresh touched_at (seconds).
 RUN_HEARTBEAT_SECONDS = int(os.environ.get("RUN_HEARTBEAT_SECONDS") or "20")
 
+# Phase C durable store mode. Default "sqlite" keeps today's write path
+# (local SQLite + end-of-run account sync). Set to "postgres" or "dual"
+# only after scratch migration/isolation/rollback gates pass.
+# Rollback to "sqlite" must still read Postgres for durable rows (app merge).
+DISCOVERY_DURABLE_STORE = (os.environ.get("DISCOVERY_DURABLE_STORE") or "sqlite").strip().lower()
+
+# How many buffered durable outcomes trigger a flush (postgres/dual modes).
+DURABLE_FLUSH_BATCH_SIZE = int(os.environ.get("DURABLE_FLUSH_BATCH_SIZE") or "10")
+
+
+def durable_store_mode() -> str:
+    """Return sqlite (default), postgres, or dual."""
+    raw = (DISCOVERY_DURABLE_STORE or "sqlite").strip().lower()
+    if raw in {"postgres", "postgresql", "pg"}:
+        return "postgres"
+    if raw in {"dual", "dual-write", "dual_write"}:
+        return "dual"
+    return "sqlite"
+
+
 # How many discovery cycles this machine runs at the same time.
 # Each extra computer that runs worker.py adds this many more cycles.
 WORKER_SLOTS = int(os.environ.get("WORKER_SLOTS") or "8")

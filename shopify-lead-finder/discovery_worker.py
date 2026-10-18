@@ -73,7 +73,7 @@ def execute_run(job: dict) -> None:
 
     on_log("Cycle started. Searching public sources for shops on their own domain.")
     on_log("Loading websites already checked for this project.")
-    _seed_history(paths["db"], str(job["project_id"]))
+    _seed_history(paths["db"], str(job["project_id"]), user_id=str(job["user_id"]))
     on_log("Searching public sources. Checked websites will appear here.")
 
     countries = settings.get("target_countries")
@@ -135,8 +135,8 @@ def execute_run(job: dict) -> None:
     )
 
 
-def _seed_history(db_path, project_id: str) -> None:
-    leads, rejected = account_db.project_history(project_id)
+def _seed_history(db_path, project_id: str, user_id: str | None = None) -> None:
+    leads, rejected = account_db.project_history(project_id, user_id=user_id)
     connection = connect(db_path)
     try:
         remember_domains(connection, leads)

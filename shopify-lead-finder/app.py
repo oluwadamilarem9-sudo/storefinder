@@ -110,7 +110,7 @@ def _load_account_db():
 
     import account_db
 
-    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 7:
+    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 8:
         engine = getattr(account_db, "_engine", None)
         if engine is not None:
             try:
@@ -174,11 +174,27 @@ def _merge_account_rows(local: pd.DataFrame, remote_rows: list, rename: dict | N
 
 
 def _load_project_tables(storage: dict, token: str, project_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load project rows. Always merge Postgres so rollback to sqlite cannot hide PG-only writes."""
     leads_df, rejected_df = _load_tables(storage["db"])
     try:
         remote_leads = _backend_request(f"/projects/{project_id}/leads", token=token)
         remote_rejected = _backend_request(f"/projects/{project_id}/rejected", token=token)
     except RuntimeError:
+        return leads_df, rejected_df
+    mode = _config.durable_store_mode()
+    if mode == "postgres":
+        # Postgres is authoritative; still overlay any richer local cache fields by domain.
+        remote_leads_df = pd.DataFrame(remote_leads or [])
+        remote_rejected_df = pd.DataFrame(remote_rejected or [])
+        if not remote_leads_df.empty:
+            remote_leads_df = remote_leads_df.rename(columns={"source": "discovery_source"})
+        if not remote_rejected_df.empty:
+            remote_rejected_df = remote_rejected_df.rename(columns={"reason": "reject_reason"})
+        leads_df = _merge_account_rows(remote_leads_df, leads_df.to_dict("records") if not leads_df.empty else [])
+        rejected_df = _merge_account_rows(
+            remote_rejected_df,
+            rejected_df.to_dict("records") if not rejected_df.empty else [],
+        )
         return leads_df, rejected_df
     leads_df = _merge_account_rows(leads_df, remote_leads, {"source": "discovery_source"})
     rejected_df = _merge_account_rows(rejected_df, remote_rejected, {"reason": "reject_reason"})
@@ -304,45 +320,70 @@ if "active_run_project" not in st.session_state:
 
 
 def _sync_run_results_to_backend(project_id: str, run_id: str, result: dict, *, token: str, db_path: Path):
+    """Batch-sync this cycle's rows to the account database (Phase C)."""
     current_leads, rejected_df = _load_tables(db_path)
     lead_domains = set((result.get("this_run_lead_domains") or []))
-    if lead_domains:
+    rejected_domains = set((result.get("this_run_rejected_domains") or []))
+    leads: list[dict] = []
+    rejected: list[dict] = []
+    if lead_domains and not current_leads.empty and "domain" in current_leads.columns:
         lead_rows = current_leads[current_leads["domain"].astype(str).isin(lead_domains)]
         for _, row in lead_rows.iterrows():
-            payload = {
-                "domain": str(row.get("domain") or ""),
-                "store_name": row.get("store_name"),
-                "public_email": row.get("public_email"),
-                "country": row.get("country"),
-                "freshness_level": row.get("freshness_level"),
-                "freshness_score": int(row.get("freshness_score") or 0),
-                "source": row.get("discovery_source"),
-                "run_id": run_id,
-            }
-            _backend_request(
-                f"/projects/{project_id}/leads",
-                method="POST",
-                payload=payload,
-                token=token,
+            leads.append(
+                {
+                    "domain": str(row.get("domain") or ""),
+                    "store_name": row.get("store_name"),
+                    "public_email": row.get("public_email"),
+                    "country": row.get("country"),
+                    "freshness_level": row.get("freshness_level"),
+                    "freshness_score": int(row.get("freshness_score") or 0),
+                    "freshness_evidence": row.get("freshness_evidence"),
+                    "source": row.get("discovery_source"),
+                    "source_url": row.get("source_url"),
+                    "shopify_status": row.get("shopify_status"),
+                    "run_id": run_id,
+                }
             )
-
-    rejected_domains = set((result.get("this_run_rejected_domains") or []))
-    if rejected_domains:
+    if rejected_domains and not rejected_df.empty and "domain" in rejected_df.columns:
         rejected_rows = rejected_df[rejected_df["domain"].astype(str).isin(rejected_domains)]
         for _, row in rejected_rows.iterrows():
-            payload = {
-                "domain": str(row.get("domain") or ""),
-                "store_name": row.get("store_name"),
-                "public_email": row.get("public_email"),
-                "reason": row.get("reject_reason") or "rejected_by_filters",
-                "run_id": run_id,
-            }
-            _backend_request(
-                f"/projects/{project_id}/rejected",
-                method="POST",
-                payload=payload,
-                token=token,
+            rejected.append(
+                {
+                    "domain": str(row.get("domain") or ""),
+                    "store_name": row.get("store_name"),
+                    "public_email": row.get("public_email"),
+                    "reason": row.get("reject_reason") or "rejected_by_filters",
+                    "freshness_level": row.get("freshness_level"),
+                    "freshness_score": int(row.get("freshness_score") or 0),
+                    "freshness_evidence": row.get("freshness_evidence"),
+                    "source": row.get("discovery_source"),
+                    "source_url": row.get("source_url"),
+                    "shopify_status": row.get("shopify_status"),
+                    "run_id": run_id,
+                }
             )
+    if not leads and not rejected:
+        return
+    account_db = _load_account_db()
+    user = st.session_state.get("backend_user") or {}
+    user_id = str(user.get("id") or "")
+    if account_db.using_database() and user_id:
+        account_db.store_run_rows(str(project_id), user_id, str(run_id), leads, rejected)
+        return
+    for payload in leads:
+        _backend_request(
+            f"/projects/{project_id}/leads",
+            method="POST",
+            payload=payload,
+            token=token,
+        )
+    for payload in rejected:
+        _backend_request(
+            f"/projects/{project_id}/rejected",
+            method="POST",
+            payload=payload,
+            token=token,
+        )
 
 
 st.title("Shopify Public Lead Finder")
@@ -587,6 +628,18 @@ if run_clicked:
     last_heartbeat = {"at": 0.0}
     heartbeat_seconds = float(getattr(_config, "RUN_HEARTBEAT_SECONDS", 20) or 20)
 
+    durable_sink = None
+    durable_mode = _config.durable_store_mode()
+    user = st.session_state.get("backend_user") or {}
+    if durable_mode in {"postgres", "dual"} and run_id and user.get("id"):
+        from durable_store import DurableWriteBuffer
+
+        durable_sink = DurableWriteBuffer(
+            project_id=str(project_id),
+            user_id=str(user["id"]),
+            run_id=str(run_id),
+        )
+
     def on_heartbeat() -> None:
         if not run_id:
             return
@@ -598,6 +651,11 @@ if run_clicked:
             _load_account_db().touch_run(str(run_id))
         except Exception:
             pass
+        if durable_sink is not None:
+            try:
+                durable_sink.maybe_flush_on_heartbeat()
+            except Exception:
+                pass
 
     try:
         with st.spinner("Searching public sources and checking websites..."):
@@ -612,7 +670,10 @@ if run_clicked:
                 db_path=storage["db"],
                 leads_csv=storage["leads_csv"],
                 rejected_csv=storage["rejected_csv"],
+                durable_sink=durable_sink,
             )
+            if durable_sink is not None:
+                durable_sink.flush()
     except Exception as exc:
         on_log(f"Discovery stopped: {exc}")
         st.session_state.logs = logs
@@ -643,7 +704,21 @@ if run_clicked:
     st.session_state.this_run_rejected_domains = list(result.get("this_run_rejected_domains") or [])
 
     sync_error = ""
-    if st.session_state.auth_token and project_id and run_id:
+    # Default sqlite mode: end-of-run batch sync. postgres/dual already flushed via sink.
+    if durable_mode == "sqlite" and st.session_state.auth_token and project_id and run_id:
+        try:
+            _sync_run_results_to_backend(
+                project_id,
+                run_id,
+                result,
+                token=st.session_state.auth_token,
+                db_path=storage["db"],
+            )
+        except RuntimeError as exc:
+            sync_error = str(exc)
+            st.warning(f"Project sync warning: {exc}")
+    elif durable_mode == "dual" and st.session_state.auth_token and project_id and run_id:
+        # Dual already flushed via sink; keep end sync as a safety net for any missed rows.
         try:
             _sync_run_results_to_backend(
                 project_id,
