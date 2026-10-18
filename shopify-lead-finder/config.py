@@ -21,6 +21,9 @@ REQUEST_TIMEOUT = 5
 # How many different websites to open at the same time during one cycle.
 CHECK_WORKERS = 6
 
+# Hard stop for one website check. A slow site is skipped so the cycle moves on.
+SITE_CHECK_TIMEOUT = 12
+
 # How many discovery cycles this machine runs at the same time.
 # Each extra computer that runs worker.py adds this many more cycles.
 WORKER_SLOTS = int(os.environ.get("WORKER_SLOTS") or "8")

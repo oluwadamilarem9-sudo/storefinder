@@ -193,17 +193,31 @@ def _socket_of(response):
 
 
 def _read_body(response, limit: int, deadline: float) -> bytes:
-    """Read the public page, and stop when the time for this download is up.
-
-    One read stops as soon as some bytes arrive. A site that trickles data
-    cannot hold the run until the whole page finishes.
-    """
+    """Read the public page, and stop when the time for this download is up."""
     sock = _socket_of(response)
     if sock is not None:
         try:
             sock.settimeout(1.0)
         except Exception:
             pass
+    stop = Event()
+
+    def cut_off() -> None:
+        while not stop.wait(0.25):
+            if time.monotonic() < deadline:
+                continue
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+            try:
+                response.close()
+            except Exception:
+                pass
+            return
+
+    Thread(target=cut_off, daemon=True).start()
     try:
         response.raw._init_decoder()
     except Exception:
@@ -212,26 +226,26 @@ def _read_body(response, limit: int, deadline: float) -> bytes:
     chunks: list[bytes] = []
     size = 0
     complete = False
-    while size < limit and time.monotonic() < deadline:
-        try:
-            piece = response.raw._fp.read1(65536)
-        except Exception:
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.05)
-            continue
-        if not piece:
-            complete = True
-            break
-        if decoder is not None:
+    try:
+        while size < limit and time.monotonic() < deadline:
             try:
-                piece = decoder.decompress(piece)
+                piece = response.raw._fp.read1(65536)
             except Exception:
-                piece = b""
-        if not piece:
-            continue
-        chunks.append(piece)
-        size += len(piece)
+                break
+            if not piece:
+                complete = True
+                break
+            if decoder is not None:
+                try:
+                    piece = decoder.decompress(piece)
+                except Exception:
+                    piece = b""
+            if not piece:
+                continue
+            chunks.append(piece)
+            size += len(piece)
+    finally:
+        stop.set()
     if decoder is not None and (complete or size >= limit):
         try:
             tail = decoder.flush()

@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import config
 from contact.public_contact_finder import find_public_contacts
@@ -98,9 +98,9 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v19")
+        log("Discovery engine v20")
         log("This run checks each shop on its own domain. A myshopify.com name is not checked and is not saved.")
-        log("Several websites are checked at the same time.")
+        log("Several websites are checked at the same time. A slow website is skipped after a few seconds.")
         log("A password page is checked again on a later run. It is not published until the shop opens.")
         log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
@@ -194,40 +194,58 @@ def run_cycle(
                     local.close()
 
             workers = min(config.CHECK_WORKERS, len(pending))
-            if workers <= 1:
-                for candidate, index in pending:
-                    try:
-                        counted = _process_candidate(
-                            connection,
-                            candidate,
-                            index,
-                            max_domains,
-                            stats,
-                            log,
-                            countries,
-                            keep_unknown,
-                        )
-                    except Exception as exc:
-                        log(f"  Error on {candidate.domain}: {exc}")
-                        try:
-                            mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
-                        except Exception:
-                            pass
-                        counted = True
-                    finish_one(counted, [])
-                return
-
+            site_limit = float(getattr(config, "SITE_CHECK_TIMEOUT", 12) or 12)
             for candidate, index in pending:
                 log(f"[{index}/{max_domains}] Checking {candidate.domain}")
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+
+            # Never use `with ThreadPoolExecutor`: on exit it waits forever for hung downloads.
+            pool = ThreadPoolExecutor(max_workers=workers)
+            try:
                 futures = {
                     pool.submit(quiet, candidate, index): (candidate, index)
                     for candidate, index in pending
                 }
-                for future in as_completed(futures):
-                    counted, lines = future.result()
-                    # Checking already printed above; keep result lines only.
-                    finish_one(counted, [line for line in lines if "] Checking " not in line])
+                started = {future: time.monotonic() for future in futures}
+                outstanding = set(futures)
+                while outstanding:
+                    done, outstanding = wait(
+                        outstanding,
+                        timeout=1.0,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        candidate, _index = futures[future]
+                        try:
+                            counted, lines = future.result(timeout=0)
+                        except Exception as exc:
+                            counted = True
+                            lines = [f"  Error on {candidate.domain}: {exc}"]
+                        finish_one(
+                            counted,
+                            [line for line in lines if "] Checking " not in line],
+                        )
+                    now = time.monotonic()
+                    timed_out = [
+                        future
+                        for future in list(outstanding)
+                        if now - started[future] >= site_limit
+                    ]
+                    for future in timed_out:
+                        candidate, _index = futures[future]
+                        outstanding.discard(future)
+                        log(f"  Status: skipped (timeout) on {candidate.domain}")
+                        try:
+                            mark_processed(
+                                connection,
+                                candidate.domain,
+                                "UNKNOWN",
+                                candidate.source,
+                            )
+                        except Exception:
+                            pass
+                        finish_one(True, [])
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
 
         if watching:
             log(f"Rechecking {len(watching)} shop(s) still behind a password page.")

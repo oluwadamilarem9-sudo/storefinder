@@ -17,7 +17,7 @@ from utils.normalization import website_url
 
 _CACHE: dict[str, RobotFileParser | None] = {}
 _CACHE_LOCK = Lock()
-_ROBOTS_TIMEOUT = 3
+_ROBOTS_TIMEOUT = 2
 
 
 def robots_allowed(url: str, user_agent: str = USER_AGENT) -> bool:
@@ -75,5 +75,5 @@ def _read_robots(robots_url: str) -> str | None:
 
     thread = Thread(target=download, daemon=True)
     thread.start()
-    thread.join(_ROBOTS_TIMEOUT + 1)
+    thread.join(_ROBOTS_TIMEOUT + 0.5)
     return box.get("raw")
