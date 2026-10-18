@@ -51,6 +51,7 @@ def _append_stat(stats: dict, key: str, value: str) -> None:
 def run_cycle(
     *,
     on_log: LogFn | None = None,
+    on_heartbeat: Callable[[], None] | None = None,
     max_domains: int | None = None,
     min_freshness: str | None = None,
     enable_secondary: bool | None = None,
@@ -77,6 +78,14 @@ def run_cycle(
         if on_log:
             on_log(message)
 
+    def beat() -> None:
+        if not on_heartbeat:
+            return
+        try:
+            on_heartbeat()
+        except Exception:
+            pass
+
     stats = {
         "candidates": 0,
         "shopify": 0,
@@ -98,7 +107,7 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v20")
+        log("Discovery engine v21")
         log("This run checks each shop on its own domain. A myshopify.com name is not checked and is not saved.")
         log("Several websites are checked at the same time. A slow website is skipped after a few seconds.")
         log("A password page is checked again on a later run. It is not published until the shop opens.")
@@ -167,8 +176,17 @@ def run_cycle(
                         stats["slowed_down"] = True
                         log("Storefronts asked us to slow down. Remaining shops stay for a later run.")
 
+            abandoned_domains: set[str] = set()
+            abandoned_lock = threading.Lock()
+
+            def is_cancelled(domain: str) -> bool:
+                with abandoned_lock:
+                    return domain in abandoned_domains
+
             def quiet(candidate, index: int):
                 lines: list[str] = []
+                if is_cancelled(candidate.domain):
+                    return True, [f"  Status: skipped (abandoned) on {candidate.domain}"]
                 local = connect(db_path)
                 try:
                     try:
@@ -181,14 +199,20 @@ def run_cycle(
                             lines.append,
                             countries,
                             keep_unknown,
+                            is_cancelled=lambda: is_cancelled(candidate.domain),
                         )
                     except Exception as exc:
+                        if is_cancelled(candidate.domain):
+                            return True, [f"  Status: skipped (abandoned) on {candidate.domain}"]
                         lines.append(f"  Error on {candidate.domain}: {exc}")
                         try:
                             mark_processed(local, candidate.domain, "UNKNOWN", candidate.source)
                         except Exception:
                             pass
                         counted = True
+                    if is_cancelled(candidate.domain):
+                        # Late finish after the site was timed out: ignore result lines.
+                        return True, [f"  Status: skipped (late result ignored) on {candidate.domain}"]
                     return counted, lines
                 finally:
                     local.close()
@@ -224,6 +248,7 @@ def run_cycle(
                             counted,
                             [line for line in lines if "] Checking " not in line],
                         )
+                        beat()
                     now = time.monotonic()
                     timed_out = [
                         future
@@ -233,6 +258,8 @@ def run_cycle(
                     for future in timed_out:
                         candidate, _index = futures[future]
                         outstanding.discard(future)
+                        with abandoned_lock:
+                            abandoned_domains.add(candidate.domain)
                         log(f"  Status: skipped (timeout) on {candidate.domain}")
                         try:
                             mark_processed(
@@ -244,6 +271,7 @@ def run_cycle(
                         except Exception:
                             pass
                         finish_one(True, [])
+                        beat()
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
@@ -285,6 +313,7 @@ def run_cycle(
             ][:remaining]
 
             log(f"Unused websites to check this pass: {len(to_check)}")
+            beat()
             if not to_check:
                 log(
                     f"Public sources ran out after {stats['checked']} of {max_domains} websites."
@@ -295,6 +324,7 @@ def run_cycle(
                 if stats.get("slowed_down") or stats["checked"] >= max_domains:
                     break
                 check_many(to_check[start : start + config.CHECK_WORKERS])
+                beat()
 
         stats["count_complete"] = stats["checked"] >= max_domains
         stats["complete"] = len(stats["this_run_lead_domains"]) > 0
@@ -323,11 +353,22 @@ def _process_candidate(
     log: LogFn,
     countries: list[str],
     keep_unknown: bool,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> bool:
     domain = candidate.domain
     log(f"[{index}/{total}] Checking {domain}")
 
+    def cancelled() -> bool:
+        return bool(is_cancelled and is_cancelled())
+
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
+
     homepage = _fetch_storefront(domain)
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
 
     if not homepage.ok:
         if homepage.error == "429":
@@ -339,6 +380,9 @@ def _process_candidate(
 
     final_domain = normalize_domain(homepage.final_url or domain)
     if not is_usable_shop_domain(final_domain) or is_junk_store_domain(final_domain):
+        if cancelled():
+            log(f"  Status: skipped (abandoned) on {domain}")
+            return True
         log("  Status: rejected (demo, test, or platform host)")
         upsert_rejected(
             connection,
@@ -357,6 +401,9 @@ def _process_candidate(
 
     shopify_status = detect_shopify(homepage.text, homepage.headers)
     log(f"  Shopify: {shopify_status}")
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
 
     if shopify_status != "SHOPIFY":
         mark_processed(connection, final_domain, shopify_status, candidate.source)
@@ -372,12 +419,18 @@ def _process_candidate(
             website_url(custom_domain),
             allow_cross_domain_redirect=True,
         )
+        if cancelled():
+            log(f"  Status: skipped (abandoned) on {domain}")
+            return True
         if custom_home.ok:
             homepage = custom_home
             final_domain = normalize_domain(custom_home.final_url or custom_domain)
         else:
             final_domain = custom_domain
     if str(final_domain).endswith(".myshopify.com") and not is_password_page(homepage.text):
+        if cancelled():
+            log(f"  Status: skipped (abandoned) on {domain}")
+            return True
         _reject(
             connection,
             stats,
@@ -393,6 +446,9 @@ def _process_candidate(
         return True
 
     _add_stat(stats, "shopify")
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
     if is_password_page(homepage.text):
         _reject(
             connection,
@@ -409,6 +465,9 @@ def _process_candidate(
         return True
 
     profile = inspect_storefront(final_domain, homepage.text)
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
     log(f"  Catalog: {profile.evidence()}")
     if profile.password_page:
         _reject(
@@ -425,6 +484,9 @@ def _process_candidate(
         )
         return True
     if not profile.product_names:
+        if cancelled():
+            log(f"  Status: skipped (abandoned) on {domain}")
+            return True
         _add_stat(stats, "low")
         _reject(
             connection,
@@ -441,6 +503,9 @@ def _process_candidate(
         return True
 
     contacts = find_public_contacts(final_domain, homepage.text)
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
     published_country = contacts.get("country") or ""
     country_code = normalize_country(published_country)
     log(
@@ -476,6 +541,9 @@ def _process_candidate(
             )
             return True
 
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
     record = {
         **contacts,
         "domain": final_domain,

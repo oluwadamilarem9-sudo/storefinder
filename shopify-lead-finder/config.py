@@ -27,6 +27,12 @@ CHECK_WORKERS = int(os.environ.get("CHECK_WORKERS") or "1")
 # Hard stop for one website check. A slow site is skipped so the cycle moves on.
 SITE_CHECK_TIMEOUT = int(os.environ.get("SITE_CHECK_TIMEOUT") or "12")
 
+# A running cycle with no heartbeat for this many minutes is treated as abandoned.
+RUN_STALE_MINUTES = int(os.environ.get("RUN_STALE_MINUTES") or "20")
+
+# How often the on-page cycle may refresh touched_at (seconds).
+RUN_HEARTBEAT_SECONDS = int(os.environ.get("RUN_HEARTBEAT_SECONDS") or "20")
+
 # How many discovery cycles this machine runs at the same time.
 # Each extra computer that runs worker.py adds this many more cycles.
 WORKER_SLOTS = int(os.environ.get("WORKER_SLOTS") or "8")

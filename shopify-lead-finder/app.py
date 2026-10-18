@@ -110,7 +110,7 @@ def _load_account_db():
 
     import account_db
 
-    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 6:
+    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 7:
         engine = getattr(account_db, "_engine", None)
         if engine is not None:
             try:
@@ -575,7 +575,7 @@ if run_clicked:
             )
             st.session_state.backend_run_id = backend_run.get("id")
         except RuntimeError as exc:
-            st.warning(f"Project run could not be created in the backend: {exc}")
+            st.warning(str(exc))
             st.session_state.backend_run_id = None
             st.stop()
     else:
@@ -584,11 +584,27 @@ if run_clicked:
 
     result = None
     run_id = st.session_state.get("backend_run_id")
+    last_heartbeat = {"at": 0.0}
+    heartbeat_seconds = float(getattr(_config, "RUN_HEARTBEAT_SECONDS", 20) or 20)
+
+    def on_heartbeat() -> None:
+        if not run_id:
+            return
+        now = time.monotonic()
+        if now - last_heartbeat["at"] < heartbeat_seconds:
+            return
+        last_heartbeat["at"] = now
+        try:
+            _load_account_db().touch_run(str(run_id))
+        except Exception:
+            pass
+
     try:
         with st.spinner("Searching public sources and checking websites..."):
             run_cycle = _load_run_cycle()
             result = run_cycle(
                 on_log=on_log,
+                on_heartbeat=on_heartbeat,
                 max_domains=check_limit,
                 enable_secondary=enable_secondary,
                 target_countries=[] if all_countries else selected_country_codes,

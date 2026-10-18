@@ -22,7 +22,7 @@ from sqlalchemy.pool import NullPool
 Base = declarative_base()
 _engine = None
 _Session = None
-_ACCOUNT_DB_GENERATION = 6
+_ACCOUNT_DB_GENERATION = 7
 
 
 class User(Base):
@@ -283,7 +283,11 @@ def _route(session, path: str, method: str, payload: dict, token: str):
     if run_match and method == "POST":
         user = _require_user(session, token)
         project = _owned_project(session, user.id, run_match.group(1))
-        # A new click replaces any cycle that sat open without finishing.
+        _close_stale_open_runs(
+            session,
+            project_id=project.id,
+            user_id=user.id,
+        )
         open_rows = (
             session.query(DiscoveryRun)
             .filter(
@@ -293,11 +297,22 @@ def _route(session, path: str, method: str, payload: dict, token: str):
             )
             .all()
         )
+        # Refuse a second live cycle for the same project (duplicate-run prevention).
+        for old in open_rows:
+            if _run_is_fresh(old):
+                raise RuntimeError(
+                    "A discovery cycle is already running for this project. "
+                    "Wait for it to finish, or wait until it is marked abandoned."
+                )
         now = datetime.now(timezone.utc).isoformat()
         for old in open_rows:
-            old.status = "failed"
-            old.error = "Replaced by a new discovery cycle."
-            old.touched_at = now
+            _mark_run_terminal(
+                old,
+                status="cancelled",
+                summary="Replaced by a new discovery cycle.",
+                error="Replaced by a new discovery cycle.",
+                touched_at=now,
+            )
         max_domains = min(max(int(payload.get("max_domains") or 20), 1), 100)
         run = DiscoveryRun(
             project_id=project.id,
@@ -308,6 +323,12 @@ def _route(session, path: str, method: str, payload: dict, token: str):
             settings_json=json.dumps(payload.get("settings") or {}),
             log_text="Cycle started. Searching public sources for shops on their own domain.",
             touched_at=now,
+            result_json=json.dumps(
+                {
+                    "started_at": now,
+                    "status": "running" if payload.get("on_page") else "queued",
+                }
+            ),
         )
         session.add(run)
         session.commit()
@@ -469,22 +490,99 @@ def _stamp(value) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _reclaim_stale_runs(session) -> None:
-    """Close a cycle that sat with no progress instead of leaving it forever."""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=3)
-    rows = session.query(DiscoveryRun).filter(DiscoveryRun.status == "running").all()
-    changed = False
+def _stale_after() -> timedelta:
+    try:
+        from config import RUN_STALE_MINUTES
+
+        minutes = int(RUN_STALE_MINUTES or 20)
+    except Exception:
+        minutes = 20
+    return timedelta(minutes=max(minutes, 1))
+
+
+def _run_is_fresh(run: DiscoveryRun) -> bool:
+    """True when a queued/running cycle still has a recent heartbeat."""
+    if run.status not in {"queued", "running"}:
+        return False
+    stamp = _stamp(run.touched_at) or _stamp(run.created_at)
+    if stamp is None:
+        return False
+    return stamp >= datetime.now(timezone.utc) - _stale_after()
+
+
+def _mark_run_terminal(
+    run: DiscoveryRun,
+    *,
+    status: str,
+    summary: str,
+    error: str,
+    touched_at: str,
+) -> None:
+    payload = {}
+    if run.result_json:
+        try:
+            parsed = json.loads(run.result_json)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except json.JSONDecodeError:
+            payload = {}
+    started = payload.get("started_at") or (_iso(run.created_at) if run.created_at else touched_at)
+    payload["started_at"] = started
+    payload["completed_at"] = touched_at
+    payload["status"] = status
+    run.status = status
+    run.summary = summary
+    run.error = (error or "")[:500]
+    run.result_json = json.dumps(payload, default=str)
+    run.touched_at = touched_at
+
+
+def _close_stale_open_runs(session, *, project_id: str | None = None, user_id: str | None = None) -> int:
+    """Fail abandoned queued/running cycles. Returns how many were closed."""
+    query = session.query(DiscoveryRun).filter(DiscoveryRun.status.in_(("queued", "running")))
+    if project_id:
+        query = query.filter(DiscoveryRun.project_id == project_id)
+    if user_id:
+        query = query.filter(DiscoveryRun.user_id == user_id)
+    rows = query.all()
     now = datetime.now(timezone.utc).isoformat()
+    closed = 0
     for run in rows:
-        stamp = _stamp(run.touched_at)
-        if stamp is not None and stamp >= cutoff:
+        if _run_is_fresh(run):
             continue
-        run.status = "failed"
-        run.error = "Cycle stopped because it sat with no progress."
-        run.touched_at = now
-        changed = True
-    if changed:
+        _mark_run_terminal(
+            run,
+            status="failed",
+            summary="Cycle stopped because it sat with no progress.",
+            error="Cycle stopped because it sat with no progress.",
+            touched_at=now,
+        )
+        closed += 1
+    if closed:
         session.commit()
+    return closed
+
+
+def _reclaim_stale_runs(session) -> None:
+    """Close a cycle that sat with no heartbeat instead of leaving it forever."""
+    _close_stale_open_runs(session)
+
+
+def touch_run(run_id: str) -> bool:
+    """Heartbeat for a long on-page cycle. False when the run is no longer running."""
+    url = database_url()
+    if not url or not run_id:
+        return False
+    session = _session(url)
+    try:
+        run = session.get(DiscoveryRun, run_id)
+        if run is None or run.status != "running":
+            return False
+        run.touched_at = datetime.now(timezone.utc).isoformat()
+        session.commit()
+        return True
+    finally:
+        session.close()
 
 
 def claim_next_run() -> dict | None:
@@ -563,7 +661,7 @@ def save_run_log(run_id: str, log_text: str) -> None:
 
 
 def finish_run(run_id: str, *, status: str, summary: str, result: dict, error: str = "") -> None:
-    """Mark a discovery run finished. status must be complete or failed — never leave running."""
+    """Mark a discovery run finished. Idempotent once the run is already terminal."""
     url = database_url()
     if not url:
         return
@@ -572,16 +670,26 @@ def finish_run(run_id: str, *, status: str, summary: str, result: dict, error: s
     # A failed operation must not be stored as complete.
     if err and terminal == "complete":
         terminal = "failed"
-    if terminal not in {"complete", "failed"}:
+    if terminal not in {"complete", "failed", "cancelled"}:
         terminal = "failed" if err else "complete"
     session = _session(url)
     try:
         run = session.get(DiscoveryRun, run_id)
         if run is None:
             return
+        # Do not reopen or rewrite a run that already finished.
+        if run.status in {"complete", "failed", "cancelled"}:
+            return
         completed_at = datetime.now(timezone.utc).isoformat()
         started_at = _iso(run.created_at) if run.created_at else completed_at
         payload = dict(result or {})
+        if run.result_json:
+            try:
+                prior = json.loads(run.result_json)
+                if isinstance(prior, dict) and prior.get("started_at"):
+                    started_at = str(prior["started_at"])
+            except json.JSONDecodeError:
+                pass
         payload.setdefault("started_at", started_at)
         payload["completed_at"] = completed_at
         payload["status"] = terminal
