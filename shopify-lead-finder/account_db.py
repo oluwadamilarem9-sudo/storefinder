@@ -22,7 +22,7 @@ from sqlalchemy.pool import NullPool
 Base = declarative_base()
 _engine = None
 _Session = None
-_ACCOUNT_DB_GENERATION = 5
+_ACCOUNT_DB_GENERATION = 6
 
 
 class User(Base):
@@ -165,6 +165,19 @@ def handle(path: str, method: str, payload: dict | None, token: str | None):
 
 _ENGINE_LOCK = threading.Lock()
 _DB_SLOTS = threading.BoundedSemaphore(2)
+
+
+def reset_account_db_engine() -> None:
+    """Test helper: drop the process-wide SQLAlchemy engine so a temp DB can be used."""
+    global _engine, _Session
+    with _ENGINE_LOCK:
+        if _engine is not None:
+            try:
+                _engine.dispose()
+            except Exception:
+                pass
+        _engine = None
+        _Session = None
 
 
 def _session(url: str):
@@ -550,18 +563,33 @@ def save_run_log(run_id: str, log_text: str) -> None:
 
 
 def finish_run(run_id: str, *, status: str, summary: str, result: dict, error: str = "") -> None:
+    """Mark a discovery run finished. status must be complete or failed — never leave running."""
     url = database_url()
     if not url:
         return
+    terminal = (status or "").strip().lower()
+    err = (error or "").strip()
+    # A failed operation must not be stored as complete.
+    if err and terminal == "complete":
+        terminal = "failed"
+    if terminal not in {"complete", "failed"}:
+        terminal = "failed" if err else "complete"
     session = _session(url)
     try:
         run = session.get(DiscoveryRun, run_id)
         if run is None:
             return
-        run.status = status
-        run.summary = summary
-        run.error = (error or "")[:500]
-        run.result_json = json.dumps(result, default=str)
+        completed_at = datetime.now(timezone.utc).isoformat()
+        started_at = _iso(run.created_at) if run.created_at else completed_at
+        payload = dict(result or {})
+        payload.setdefault("started_at", started_at)
+        payload["completed_at"] = completed_at
+        payload["status"] = terminal
+        run.status = terminal
+        run.summary = summary or ""
+        run.error = err[:500]
+        run.result_json = json.dumps(payload, default=str)
+        run.touched_at = completed_at
         session.commit()
     finally:
         session.close()

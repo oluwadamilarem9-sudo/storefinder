@@ -19,10 +19,13 @@ REQUEST_DELAY = 0.2
 REQUEST_TIMEOUT = 5
 
 # How many different websites to open at the same time during one cycle.
-CHECK_WORKERS = 6
+# Temporary Phase A default is 1 so the deadlock fix can be verified serially.
+# Override with CHECK_WORKERS=6 (or higher) after Phase A is confirmed.
+# Do not treat this as the permanent parallel setting.
+CHECK_WORKERS = int(os.environ.get("CHECK_WORKERS") or "1")
 
 # Hard stop for one website check. A slow site is skipped so the cycle moves on.
-SITE_CHECK_TIMEOUT = 12
+SITE_CHECK_TIMEOUT = int(os.environ.get("SITE_CHECK_TIMEOUT") or "12")
 
 # How many discovery cycles this machine runs at the same time.
 # Each extra computer that runs worker.py adds this many more cycles.

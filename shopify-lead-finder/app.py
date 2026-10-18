@@ -60,6 +60,43 @@ def _load_run_cycle():
 
     return run_cycle
 
+
+def _clear_account_session_state() -> None:
+    """Drop every account-scoped UI value so the next user cannot see the last one."""
+    from session_reset import clear_account_session_state
+
+    clear_account_session_state(st.session_state)
+
+
+def _finish_on_page_run(
+    run_id: str | None,
+    *,
+    status: str,
+    summary: str,
+    result: dict,
+    error: str = "",
+    log_text: str = "",
+) -> None:
+    """Every on-page cycle must leave running and reach complete or failed."""
+    if not run_id:
+        return
+    account_db = _load_account_db()
+    if log_text:
+        try:
+            account_db.save_run_log(str(run_id), log_text)
+        except Exception:
+            pass
+    try:
+        account_db.finish_run(
+            str(run_id),
+            status=status,
+            summary=summary,
+            result=result,
+            error=error,
+        )
+    except Exception:
+        pass
+
 st.set_page_config(
     page_title="Shopify Public Lead Finder",
     page_icon="🛍️",
@@ -73,7 +110,7 @@ def _load_account_db():
 
     import account_db
 
-    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 5:
+    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 6:
         engine = getattr(account_db, "_engine", None)
         if engine is not None:
             try:
@@ -344,10 +381,9 @@ with st.sidebar:
                         method="POST",
                         payload={"email": email, "password": password},
                     )
+                    _clear_account_session_state()
                     st.session_state.auth_token = user["token"]
                     st.session_state.backend_user = user["user"]
-                    st.session_state.backend_projects = []
-                    st.session_state.selected_project_id = None
                     st.rerun()
                 except RuntimeError as exc:
                     st.error(str(exc))
@@ -359,10 +395,9 @@ with st.sidebar:
                         method="POST",
                         payload={"name": email.split("@")[0], "email": email, "password": password},
                     )
+                    _clear_account_session_state()
                     st.session_state.auth_token = user["token"]
                     st.session_state.backend_user = user["user"]
-                    st.session_state.backend_projects = []
-                    st.session_state.selected_project_id = None
                     st.rerun()
                 except RuntimeError as exc:
                     st.error(str(exc))
@@ -371,10 +406,7 @@ with st.sidebar:
         st.write(f"Signed in as: {user.get('name', 'User')}")
         st.write(user.get('email', ''))
         if st.button("Logout"):
-            st.session_state.auth_token = None
-            st.session_state.backend_user = None
-            st.session_state.selected_project_id = None
-            st.session_state.backend_projects = []
+            _clear_account_session_state()
             st.rerun()
 
         with st.form("project_form"):
@@ -551,6 +583,7 @@ if run_clicked:
         st.stop()
 
     result = None
+    run_id = st.session_state.get("backend_run_id")
     try:
         with st.spinner("Searching public sources and checking websites..."):
             run_cycle = _load_run_cycle()
@@ -566,19 +599,21 @@ if run_clicked:
             )
     except Exception as exc:
         on_log(f"Discovery stopped: {exc}")
-        run_id = st.session_state.get("backend_run_id")
-        if run_id:
-            try:
-                _load_account_db().finish_run(
-                    str(run_id),
-                    status="failed",
-                    summary="Discovery stopped before it finished.",
-                    result={},
-                    error=str(exc),
-                )
-            except Exception:
-                pass
         st.session_state.logs = logs
+        _finish_on_page_run(
+            run_id,
+            status="failed",
+            summary="Discovery stopped before it finished.",
+            result={
+                "saved": 0,
+                "complete": False,
+                "lead_domains": [],
+                "rejected_domains": [],
+                "stats": {},
+            },
+            error=str(exc),
+            log_text="\n".join(logs[-80:]),
+        )
         st.session_state.flash_kind = "warning"
         st.session_state.flash = (
             "Discovery did not complete. The cycle stopped before websites finished checking. "
@@ -591,16 +626,18 @@ if run_clicked:
     st.session_state.this_run_lead_domains = list(result.get("this_run_lead_domains") or [])
     st.session_state.this_run_rejected_domains = list(result.get("this_run_rejected_domains") or [])
 
-    if st.session_state.auth_token and project_id and st.session_state.backend_run_id:
+    sync_error = ""
+    if st.session_state.auth_token and project_id and run_id:
         try:
             _sync_run_results_to_backend(
                 project_id,
-                st.session_state.backend_run_id,
+                run_id,
                 result,
                 token=st.session_state.auth_token,
                 db_path=storage["db"],
             )
         except RuntimeError as exc:
+            sync_error = str(exc)
             st.warning(f"Project sync warning: {exc}")
 
     saved = len(result.get("this_run_lead_domains") or [])
@@ -612,25 +649,53 @@ if run_clicked:
         if count_done
         else f"Checked {checked} of {requested} websites. Public sources ran out."
     )
-    complete = bool(result.get("complete")) and saved > 0
-    if complete:
+    product_complete = bool(result.get("complete")) and saved > 0
+    # Terminal state: complete only when shops were saved; empty finished runs are
+    # still complete (cycle finished) with complete=false in the result payload.
+    # Exceptions use failed above. Sync errors do not flip a finished cycle to failed.
+    finish_status = "complete"
+    if product_complete:
+        summary = f"Scraped {saved} live shop(s). {count_line}"
         st.session_state.flash_kind = "success"
         st.session_state.flash = (
             f"Scraped {saved} live shop(s). Download them from Newly scraped stores. "
             f"{count_line} Open the Qualifying leads tab."
         )
     elif result.get("checked"):
-        st.session_state.flash_kind = "warning"
-        st.session_state.flash = (
+        summary = (
             "Discovery did not complete. No live shop with a public product catalog was saved. "
-            f"{count_line} Open Rejected candidates and the Activity log."
+            + count_line
         )
-    else:
         st.session_state.flash_kind = "warning"
-        st.session_state.flash = (
+        st.session_state.flash = summary + " Open Rejected candidates and the Activity log."
+    else:
+        summary = (
             "Discovery did not complete. Public sources did not give any unused "
-            "website to check this run. Open the Activity log."
+            "website to check this run."
         )
+        st.session_state.flash_kind = "warning"
+        st.session_state.flash = summary + " Open the Activity log."
+
+    _finish_on_page_run(
+        run_id,
+        status=finish_status,
+        summary=summary,
+        result={
+            "saved": saved,
+            "complete": product_complete,
+            "lead_domains": list(result.get("this_run_lead_domains") or []),
+            "rejected_domains": list(result.get("this_run_rejected_domains") or []),
+            "stats": {
+                "checked": checked,
+                "requested": requested,
+                "count_complete": count_done,
+                "candidates": int(result.get("candidates") or 0),
+            },
+            "sync_error": sync_error,
+        },
+        error="",
+        log_text="\n".join(logs[-80:]),
+    )
     _clear_saved_tables()
     st.rerun()
 

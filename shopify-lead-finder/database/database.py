@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 
 import pandas as pd
 
@@ -17,9 +17,13 @@ from config import DATABASE_FILE, MIN_FRESHNESS_LEVEL, OUTPUT_FILE, REJECTED_FIL
 from utils.normalization import now_iso
 
 _LEVEL_RANK = {"UNKNOWN": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
-_DB_LOCK = Lock()
+# RLock: upsert_lead / upsert_rejected call mark_processed while already holding
+# this lock. A plain Lock deadlocks on that nest and freezes discovery after the
+# first save or reject. RLock keeps all writes serialized across threads and
+# allows the same thread to re-enter safely.
+_DB_LOCK = RLock()
 _READY_PATHS: set[str] = set()
-_READY_LOCK = Lock()
+_READY_LOCK = RLock()
 
 
 def _db_locked(func):
