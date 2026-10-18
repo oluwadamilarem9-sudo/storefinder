@@ -22,7 +22,7 @@ from sqlalchemy.pool import NullPool
 Base = declarative_base()
 _engine = None
 _Session = None
-_ACCOUNT_DB_GENERATION = 4
+_ACCOUNT_DB_GENERATION = 5
 
 
 class User(Base):
@@ -176,6 +176,8 @@ def _session(url: str):
                 kwargs = {"poolclass": NullPool}
                 if url.startswith("sqlite"):
                     kwargs["connect_args"] = {"check_same_thread": False}
+                elif "postgresql" in url:
+                    kwargs["connect_args"] = {"connect_timeout": 5}
                 engine = create_engine(url, **kwargs)
                 Base.metadata.create_all(bind=engine)
                 _ensure_run_columns(engine)

@@ -73,7 +73,7 @@ def _load_account_db():
 
     import account_db
 
-    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 4:
+    if getattr(account_db, "_ACCOUNT_DB_GENERATION", 0) != 5:
         engine = getattr(account_db, "_engine", None)
         if engine is not None:
             try:
@@ -502,23 +502,12 @@ if run_clicked:
     log_box = st.empty()
     logs: list[str] = ["Cycle started. Searching public sources for shops on their own domain."]
     log_box.code("\n".join(logs[-40:]), language="text")
-    last_log_flush = {"at": 0.0, "count": 0}
 
     def on_log(message: str) -> None:
+        # Keep the activity log on this page only while checking.
+        # Writing every line to the account database was freezing the cycle.
         logs.append(message)
-        log_box.code("\n".join(logs[-40:]), language="text")
-        run_id = st.session_state.get("backend_run_id")
-        if not run_id:
-            return
-        now = time.monotonic()
-        if now - last_log_flush["at"] < 2 and len(logs) - last_log_flush["count"] < 5:
-            return
-        last_log_flush["at"] = now
-        last_log_flush["count"] = len(logs)
-        try:
-            _load_account_db().save_run_log(str(run_id), "\n".join(logs[-80:]))
-        except Exception:
-            pass
+        log_box.code("\n".join(logs[-60:]), language="text")
 
     st.session_state.active_run_id = None
     st.session_state.active_run_project = None

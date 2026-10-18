@@ -19,15 +19,15 @@ REQUEST_DELAY = 0.2
 REQUEST_TIMEOUT = 5
 
 # How many different websites to open at the same time during one cycle.
-CHECK_WORKERS = 1
+CHECK_WORKERS = 6
 
 # How many discovery cycles this machine runs at the same time.
 # Each extra computer that runs worker.py adds this many more cycles.
 WORKER_SLOTS = int(os.environ.get("WORKER_SLOTS") or "8")
 
 # How many candidate websites to visit in one cycle.
-# The web UI allows 5 to 10,000. Public sources may return fewer.
-MAX_DOMAINS_PER_CYCLE = 20
+# The web UI allows 5 to 100. Public sources may return fewer.
+MAX_DOMAINS_PER_CYCLE = 50
 
 # How long to wait between cycles when running: python main.py --continuous
 DISCOVERY_INTERVAL = 60 * 60

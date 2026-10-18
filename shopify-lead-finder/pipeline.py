@@ -98,9 +98,9 @@ def run_cycle(
         log("========================================")
         log("SHOPIFY PUBLIC LEAD FINDER")
         log("========================================")
-        log("Discovery engine v18")
+        log("Discovery engine v19")
         log("This run checks each shop on its own domain. A myshopify.com name is not checked and is not saved.")
-        log("Each website is checked, then the activity log moves to the next one.")
+        log("Several websites are checked at the same time.")
         log("A password page is checked again on a later run. It is not published until the shop opens.")
         log("This run checks every website you asked for. Saving a lead does not stop it early.")
         if db_path is not None:
@@ -167,29 +167,6 @@ def run_cycle(
                         stats["slowed_down"] = True
                         log("Storefronts asked us to slow down. Remaining shops stay for a later run.")
 
-            if min(config.CHECK_WORKERS, len(pending)) <= 1:
-                for candidate, index in pending:
-                    try:
-                        counted = _process_candidate(
-                            connection,
-                            candidate,
-                            index,
-                            max_domains,
-                            stats,
-                            log,
-                            countries,
-                            keep_unknown,
-                        )
-                    except Exception as exc:
-                        log(f"  Error on {candidate.domain}: {exc}")
-                        try:
-                            mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
-                        except Exception:
-                            pass
-                        counted = True
-                    finish_one(counted, [])
-                return
-
             def quiet(candidate, index: int):
                 lines: list[str] = []
                 local = connect(db_path)
@@ -217,11 +194,40 @@ def run_cycle(
                     local.close()
 
             workers = min(config.CHECK_WORKERS, len(pending))
+            if workers <= 1:
+                for candidate, index in pending:
+                    try:
+                        counted = _process_candidate(
+                            connection,
+                            candidate,
+                            index,
+                            max_domains,
+                            stats,
+                            log,
+                            countries,
+                            keep_unknown,
+                        )
+                    except Exception as exc:
+                        log(f"  Error on {candidate.domain}: {exc}")
+                        try:
+                            mark_processed(connection, candidate.domain, "UNKNOWN", candidate.source)
+                        except Exception:
+                            pass
+                        counted = True
+                    finish_one(counted, [])
+                return
+
+            for candidate, index in pending:
+                log(f"[{index}/{max_domains}] Checking {candidate.domain}")
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(quiet, candidate, index) for candidate, index in pending]
+                futures = {
+                    pool.submit(quiet, candidate, index): (candidate, index)
+                    for candidate, index in pending
+                }
                 for future in as_completed(futures):
                     counted, lines = future.result()
-                    finish_one(counted, lines)
+                    # Checking already printed above; keep result lines only.
+                    finish_one(counted, [line for line in lines if "] Checking " not in line])
 
         if watching:
             log(f"Rechecking {len(watching)} shop(s) still behind a password page.")
@@ -494,9 +500,9 @@ def _reject(connection, stats, domain, final_domain, candidate, contacts, reason
         "freshness_evidence": evidence,
         "reject_reason": reason,
     }
-    upsert_rejected(connection, record)
-    _append_stat(stats, "this_run_rejected_domains", final_domain)
     log(f"  Status: {status}")
+    _append_stat(stats, "this_run_rejected_domains", final_domain)
+    upsert_rejected(connection, record)
     if final_domain != domain:
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
 

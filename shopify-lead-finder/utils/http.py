@@ -100,13 +100,11 @@ def fetch_public(
     for attempt in range(config.MAX_RETRIES + 1):
         response = None
         try:
-            if not _host_answers(url, 4.0):
-                return FetchResult(url=url, error="timeout")
             deadline = time.monotonic() + max(budget, 1.0)
             _wait_for_host(url)
             response = _session().get(
                 url,
-                timeout=(3, min(5.0, budget)),
+                timeout=(2.5, min(4.0, budget)),
                 allow_redirects=True,
                 headers=headers,
                 stream=True,

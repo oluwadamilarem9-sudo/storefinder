@@ -18,6 +18,8 @@ from utils.normalization import now_iso
 
 _LEVEL_RANK = {"UNKNOWN": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 _DB_LOCK = Lock()
+_READY_PATHS: set[str] = set()
+_READY_LOCK = Lock()
 
 
 def _db_locked(func):
@@ -55,13 +57,23 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     """Open the local database and create tables if needed."""
     db_path = path or DATABASE_FILE
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+    connection = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=30000")
-    _create_tables(connection)
-    _migrate_leads(connection)
-    _rehome_unscored_leads(connection)
+    connection.execute("PRAGMA busy_timeout=10000")
+    key = str(db_path.resolve())
+    with _READY_LOCK:
+        ready = key in _READY_PATHS
+    if not ready:
+        with _DB_LOCK:
+            with _READY_LOCK:
+                still_needs = key not in _READY_PATHS
+            if still_needs:
+                _create_tables(connection)
+                _migrate_leads(connection)
+                _rehome_unscored_leads(connection)
+                with _READY_LOCK:
+                    _READY_PATHS.add(key)
     return connection
 
 
