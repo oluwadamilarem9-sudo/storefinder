@@ -1,0 +1,118 @@
+import { getToken } from "./auth";
+import type { DiscoveryRun, Lead, Project, Rejected, User } from "./types";
+
+const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function request<T>(
+  path: string,
+  options: RequestInit & { auth?: boolean } = {},
+): Promise<T> {
+  const headers = new Headers(options.headers || {});
+  if (!headers.has("Content-Type") && options.body) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (options.auth !== false) {
+    const token = getToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  const response = await fetch(`${API_URL}${path}`, {
+    ...options,
+    headers,
+  });
+
+  if (!response.ok) {
+    let detail = `Request failed (${response.status})`;
+    try {
+      const data = await response.json();
+      if (typeof data?.detail === "string") detail = data.detail;
+    } catch {
+      /* ignore */
+    }
+    throw new ApiError(response.status, detail);
+  }
+
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
+}
+
+export function signup(name: string, email: string, password: string) {
+  return request<{ id: string; token: string; user: User }>("/auth/signup", {
+    method: "POST",
+    auth: false,
+    body: JSON.stringify({ name, email, password }),
+  });
+}
+
+export function login(email: string, password: string) {
+  return request<{ token: string; user: User }>("/auth/login", {
+    method: "POST",
+    auth: false,
+    body: JSON.stringify({ email, password }),
+  });
+}
+
+export function listProjects() {
+  return request<Project[]>("/projects");
+}
+
+export function createProject(name: string) {
+  return request<Project>("/projects", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function listRuns(projectId: string) {
+  return request<DiscoveryRun[]>(`/projects/${projectId}/runs`);
+}
+
+export function getRun(projectId: string, runId: string) {
+  return request<DiscoveryRun>(`/projects/${projectId}/runs/${runId}`);
+}
+
+export function createRun(
+  projectId: string,
+  payload: { name?: string; max_domains?: number; on_page?: boolean },
+) {
+  return request<DiscoveryRun>(`/projects/${projectId}/runs`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listLeads(projectId: string) {
+  return request<Lead[]>(`/projects/${projectId}/leads`);
+}
+
+export function listRejected(projectId: string) {
+  return request<Rejected[]>(`/projects/${projectId}/rejected`);
+}
+
+export function downloadCsv(filename: string, rows: Record<string, unknown>[], columns: string[]) {
+  const escape = (value: unknown) => {
+    const text = value == null ? "" : String(value);
+    if (/[",\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+    return text;
+  };
+  const lines = [columns.join(",")];
+  for (const row of rows) {
+    lines.push(columns.map((col) => escape(row[col])).join(","));
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
