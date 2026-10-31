@@ -211,6 +211,7 @@ def test_abandoned_domain_skips_late_writes(tmp_path, monkeypatch):
         log,
         countries,
         keep_unknown,
+        store_age_filter="all",
         is_cancelled=None,
         durable_sink=None,
     ):

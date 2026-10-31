@@ -247,6 +247,24 @@ button {
   gap: 16px;
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.95rem;
+}
+
+.country-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px 12px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
 .grid-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

@@ -22,14 +22,27 @@ from database.database import (
     mark_processed,
     upsert_lead,
     upsert_rejected,
+    upsert_store_products,
     watched_password_domains,
     clear_password_watch,
 )
 from detection.shopify_detector import detect_shopify
-from detection.storefront_profile import inspect_storefront, is_password_page, published_custom_domain
+from detection.storefront_profile import (
+    inspect_storefront,
+    is_password_page,
+    published_custom_domain,
+    serialize_tracking,
+)
 from discovery.candidate_manager import prepare_candidates
 from discovery.discovery_sources import DiscoveredCandidate, active_sources
 from discovery.domain_discovery import discover_candidates
+from discovery.freshness import (
+    STORE_AGE_ALL,
+    age_filter_allows,
+    classify_store_age,
+    normalize_store_age_filter,
+    prove_new_store,
+)
 from utils.console import safe_print
 from utils.countries import country_allows, country_label, normalize_country
 from utils.http import fetch_public
@@ -58,6 +71,7 @@ def run_cycle(
     enable_secondary: bool | None = None,
     target_countries: list[str] | None = None,
     keep_unknown_country: bool | None = None,
+    store_age_filter: str | None = None,
     db_path=None,
     leads_csv=None,
     rejected_csv=None,
@@ -74,6 +88,7 @@ def run_cycle(
         countries = [item.upper() for item in target_countries if item]
     keep_unknown = config.KEEP_UNKNOWN_COUNTRY if keep_unknown_country is None else keep_unknown_country
     secondary = config.ENABLE_SECONDARY_SOURCES if enable_secondary is None else enable_secondary
+    age_filter = normalize_store_age_filter(store_age_filter)
 
     def log(message: str) -> None:
         # Never let Windows console encoding abort a live cycle mid-check.
@@ -129,6 +144,14 @@ def run_cycle(
             )
         else:
             log("Country filter: any published country. Shops that do not publish a country are still saved.")
+        if age_filter == STORE_AGE_ALL:
+            log("Store-age filter: all shops. Public age evidence is still recorded when available.")
+        else:
+            log(
+                f"Store-age filter: {age_filter} only. "
+                "Age uses public RDAP/certificate/archive evidence. "
+                "First discovered by this tool is not a creation date."
+            )
         log("A public email is stored when the shop displays one.")
 
         all_watching = watched_password_domains(connection)
@@ -207,6 +230,7 @@ def run_cycle(
                             lines.append,
                             countries,
                             keep_unknown,
+                            age_filter,
                             is_cancelled=lambda: is_cancelled(candidate.domain),
                             durable_sink=durable_sink,
                         )
@@ -385,6 +409,7 @@ def _process_candidate(
     log: LogFn,
     countries: list[str],
     keep_unknown: bool,
+    store_age_filter: str = STORE_AGE_ALL,
     is_cancelled: Callable[[], bool] | None = None,
     durable_sink=None,
 ) -> bool:
@@ -555,7 +580,7 @@ def _process_candidate(
         allowed, country_reason = country_allows(
             published_country,
             countries,
-            False,
+            keep_unknown,
         )
         if not allowed:
             if country_reason == "country_unknown":
@@ -584,16 +609,67 @@ def _process_candidate(
     if cancelled():
         log(f"  Status: skipped (abandoned) on {domain}")
         return True
+
+    discovered_at = candidate.discovered_at or now_iso()
+    age_result = prove_new_store(final_domain, homepage.text)
+    if cancelled():
+        log(f"  Status: skipped (abandoned) on {domain}")
+        return True
+    store_age = classify_store_age(age_result)
+    age_note = (
+        f"First discovered by this tool at {discovered_at}. "
+        "That is not a store creation or launch date."
+    )
+    freshness_evidence = " ".join(
+        part for part in (profile.evidence(), age_result.evidence, age_note) if part
+    )
+    log(
+        f"  Store age: {store_age}"
+        + (f" (~{age_result.age_days} days from public records)" if age_result.age_days is not None else "")
+    )
+    log(f"  Age evidence: {age_result.evidence or 'No public age proof.'}")
+
+    if not age_filter_allows(store_age, store_age_filter):
+        wanted = normalize_store_age_filter(store_age_filter)
+        _reject(
+            connection,
+            stats,
+            domain,
+            final_domain,
+            candidate,
+            contacts=contacts,
+            reason="store_age_filter",
+            evidence=(
+                f"Store age class is {store_age}; this run keeps {wanted} only. "
+                + freshness_evidence
+            ),
+            log=log,
+            status=f"rejected (store age is {store_age}, filter is {wanted})",
+            durable_sink=durable_sink,
+        )
+        return True
+
+    theme_label = profile.theme_name or "not publicly identified"
+    tracking_label = (
+        ", ".join(f"{item.name} [{item.confidence}]" for item in profile.tracking)
+        if profile.tracking
+        else "none identified"
+    )
+    log(f"  Theme: {theme_label}" + (f" ({profile.theme_confidence})" if profile.theme_confidence else ""))
+    log(f"  Tracking: {tracking_label}")
     record = {
         **contacts,
         "domain": final_domain,
         "shopify_status": "SHOPIFY",
         "discovery_source": candidate.source,
         "source_url": candidate.source_url,
-        "discovered_at": candidate.discovered_at or now_iso(),
-        "freshness_score": 80,
-        "freshness_level": "HIGH",
-        "freshness_evidence": profile.evidence(),
+        "discovered_at": discovered_at,
+        "freshness_score": int(age_result.freshness_score or 0),
+        "freshness_level": age_result.freshness_level or "UNKNOWN",
+        "freshness_evidence": freshness_evidence,
+        "theme_name": profile.theme_name or "",
+        "theme_confidence": profile.theme_confidence or "",
+        "tracking_technologies": serialize_tracking(profile.tracking),
     }
     _add_stat(stats, "high")
     if (record.get("public_email") or "").strip():
@@ -601,7 +677,18 @@ def _process_candidate(
         log(f"  Email: {record['public_email']}")
     else:
         log("  Email: not published on the store")
+    product_rows = _catalog_product_dicts(profile)
+    structured = sum(1 for item in product_rows if item.get("product_url") or item.get("price"))
+    if product_rows:
+        log(
+            f"  Products: {len(product_rows)} public item(s)"
+            + (f" ({structured} with price or URL)" if structured else " (titles only)")
+        )
     upsert_lead(connection, record)
+    if product_rows:
+        if connection is not None:
+            upsert_store_products(connection, final_domain, product_rows)
+        record["products"] = product_rows
     _durable_lead(durable_sink, record)
     clear_password_watch(connection, final_domain)
     if domain != final_domain:
@@ -613,6 +700,54 @@ def _process_candidate(
         mark_processed(connection, domain, "SHOPIFY", candidate.source)
         _durable_processed(durable_sink, domain, "SHOPIFY", candidate.source)
     return True
+
+
+def _catalog_product_dicts(profile) -> list[dict]:
+    """Public catalog rows only. Empty price/category stay empty — never invented."""
+    rows: list[dict] = []
+    products = getattr(profile, "products", None) or []
+    for item in products:
+        if hasattr(item, "as_dict"):
+            payload = item.as_dict()
+        elif isinstance(item, dict):
+            payload = dict(item)
+        else:
+            continue
+        title = " ".join(str(payload.get("title") or "").split())
+        if len(title) < 2:
+            continue
+        rows.append(
+            {
+                "title": title,
+                "handle": str(payload.get("handle") or ""),
+                "product_url": str(payload.get("product_url") or ""),
+                "price": str(payload.get("price") or ""),
+                "currency": str(payload.get("currency") or ""),
+                "image_url": str(payload.get("image_url") or ""),
+                "category": str(payload.get("category") or ""),
+                "shopify_product_id": str(payload.get("shopify_product_id") or ""),
+            }
+        )
+    if rows:
+        return rows
+    # HTML title fallback: keep incomplete rows linked to the store.
+    for title in getattr(profile, "product_names", None) or []:
+        cleaned = " ".join(str(title or "").split())
+        if len(cleaned) < 2:
+            continue
+        rows.append(
+            {
+                "title": cleaned,
+                "handle": "",
+                "product_url": "",
+                "price": "",
+                "currency": "",
+                "image_url": "",
+                "category": "",
+                "shopify_product_id": "",
+            }
+        )
+    return rows
 
 
 def _durable_lead(sink, record: dict) -> None:

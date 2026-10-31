@@ -102,3 +102,18 @@ def test_users_cannot_access_each_other_projects_and_leads(tmp_path):
         headers={"Authorization": f"Bearer {token_b}"},
     )
     assert leads_for_b.status_code == 403, leads_for_b.text
+
+    for path in (
+        f"/projects/{project_id}/products",
+        f"/projects/{project_id}/watchlist",
+        f"/projects/{project_id}/filters",
+    ):
+        denied = client.get(path, headers={"Authorization": f"Bearer {token_b}"})
+        assert denied.status_code == 403, f"{path}: {denied.text}"
+
+    compare_denied = client.post(
+        f"/projects/{project_id}/compare",
+        json={"domain_a": "example.com", "domain_b": "other.com"},
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert compare_denied.status_code == 403, compare_denied.text

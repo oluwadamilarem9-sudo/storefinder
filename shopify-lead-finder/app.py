@@ -42,6 +42,7 @@ MAX_DOMAINS_PER_CYCLE = _config.MAX_DOMAINS_PER_CYCLE
 OUTPUT_FILE = _config.OUTPUT_FILE
 REJECTED_FILE = _config.REJECTED_FILE
 TARGET_COUNTRIES = _config.TARGET_COUNTRIES
+KEEP_UNKNOWN_COUNTRY = _config.KEEP_UNKNOWN_COUNTRY
 project_storage_paths = _config.project_storage_paths
 from database.database import (
     connect,
@@ -522,6 +523,26 @@ with st.sidebar:
             format_func=country_label,
             help="A store is kept only when its public page publishes one of these countries.",
         )
+        keep_unknown_country = st.checkbox(
+            "Keep shops that do not publish a country",
+            value=bool(KEEP_UNKNOWN_COUNTRY),
+            help="Only used when a country list is selected. Country is never guessed from hosting IPs or myshopify.com.",
+        )
+    store_age_filter = st.selectbox(
+        "Store age",
+        options=["all", "new", "established", "unknown"],
+        index=0,
+        format_func=lambda value: {
+            "all": "All stores",
+            "new": "New stores only",
+            "established": "Established stores only",
+            "unknown": "Unknown store age only",
+        }.get(value, value),
+        help=(
+            "Uses public RDAP, certificate, and archive evidence only. "
+            "First discovered by this tool is not a creation date."
+        ),
+    )
     st.caption(
         "A saved shop is a live store with public products. "
         "Its email and country are filled in when the store publishes them. "
@@ -610,6 +631,7 @@ if run_clicked:
                         "enable_secondary": bool(enable_secondary),
                         "target_countries": [] if all_countries else list(selected_country_codes),
                         "keep_unknown_country": bool(keep_unknown_country),
+                        "store_age_filter": str(store_age_filter),
                     },
                 },
                 token=st.session_state.auth_token,
@@ -667,6 +689,7 @@ if run_clicked:
                 enable_secondary=enable_secondary,
                 target_countries=[] if all_countries else selected_country_codes,
                 keep_unknown_country=keep_unknown_country,
+                store_age_filter=str(store_age_filter),
                 db_path=storage["db"],
                 leads_csv=storage["leads_csv"],
                 rejected_csv=storage["rejected_csv"],

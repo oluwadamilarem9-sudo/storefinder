@@ -46,17 +46,30 @@ def test_signup_login_issue_jwt_not_raw_user_id(tmp_path):
     assert login.json()["user"]["id"] == created["user"]["id"]
 
 
-def test_opaque_user_id_token_still_accepted(tmp_path):
-    """Streamlit-style bearer token (raw users.id) must keep working on the API."""
+def test_opaque_user_id_bearer_rejected_on_api(tmp_path):
+    """FastAPI is JWT-only. Streamlit keeps using account_db.handle with the user id."""
     client = _client(tmp_path)
     created = _signup(client, "opaque@example.com")
     user_id = created["user"]["id"]
     projects = client.get("/projects", headers={"Authorization": f"Bearer {user_id}"})
-    assert projects.status_code == 200
-    assert projects.json() == []
+    assert projects.status_code == 401
+
+    import account_db
+
+    # Independent Streamlit-style path still accepts the opaque user id.
+    listed = account_db.handle("/projects", "GET", None, user_id)
+    assert listed == []
 
 
-def test_device_login_creates_and_reuses_user(tmp_path):
+def test_device_login_disabled_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENABLE_DEVICE_AUTH", raising=False)
+    client = _client(tmp_path)
+    response = client.post("/auth/device", json={"device_id": "device-abc"})
+    assert response.status_code == 404
+
+
+def test_device_login_opt_in_still_works(tmp_path, monkeypatch):
+    monkeypatch.setenv("ENABLE_DEVICE_AUTH", "1")
     client = _client(tmp_path)
     first = client.post("/auth/device", json={"device_id": "device-abc"})
     assert first.status_code == 200, first.text

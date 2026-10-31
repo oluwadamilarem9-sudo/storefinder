@@ -1,5 +1,15 @@
 import { clearSession, getToken } from "./auth";
-import type { DiscoveryRun, Lead, Project, Rejected, User } from "./types";
+import type {
+  DiscoveryRun,
+  Lead,
+  Project,
+  Rejected,
+  SavedFilter,
+  StoreCompareResult,
+  StoreProduct,
+  User,
+  WatchlistItem,
+} from "./types";
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 
@@ -87,10 +97,20 @@ export function getRun(projectId: string, runId: string) {
   return request<DiscoveryRun>(`/projects/${projectId}/runs/${runId}`);
 }
 
-export function createRun(
-  projectId: string,
-  payload: { name?: string; max_domains?: number; on_page?: boolean },
-) {
+export type RunCreatePayload = {
+  name?: string;
+  max_domains?: number;
+  on_page?: boolean;
+  settings?: {
+    max_domains?: number;
+    enable_secondary?: boolean;
+    target_countries?: string[];
+    keep_unknown_country?: boolean;
+    store_age_filter?: "all" | "new" | "established" | "unknown";
+  };
+};
+
+export function createRun(projectId: string, payload: RunCreatePayload) {
   return request<DiscoveryRun>(`/projects/${projectId}/runs`, {
     method: "POST",
     body: JSON.stringify(payload),
@@ -103,6 +123,55 @@ export function listLeads(projectId: string) {
 
 export function listRejected(projectId: string) {
   return request<Rejected[]>(`/projects/${projectId}/rejected`);
+}
+
+export function listProducts(projectId: string) {
+  return request<StoreProduct[]>(`/projects/${projectId}/products`);
+}
+
+export function compareStores(projectId: string, domainA: string, domainB: string) {
+  return request<StoreCompareResult>(`/projects/${projectId}/compare`, {
+    method: "POST",
+    body: JSON.stringify({ domain_a: domainA, domain_b: domainB }),
+  });
+}
+
+export function listWatchlist(projectId: string) {
+  return request<WatchlistItem[]>(`/projects/${projectId}/watchlist`);
+}
+
+export function addWatchlist(projectId: string, domain: string, note?: string) {
+  return request<WatchlistItem>(`/projects/${projectId}/watchlist`, {
+    method: "POST",
+    body: JSON.stringify({ domain, note: note || null }),
+  });
+}
+
+export function removeWatchlist(projectId: string, itemId: string) {
+  return request<{ ok: boolean }>(`/projects/${projectId}/watchlist/${itemId}`, {
+    method: "DELETE",
+  });
+}
+
+export function listSavedFilters(projectId: string) {
+  return request<SavedFilter[]>(`/projects/${projectId}/filters`);
+}
+
+export function createSavedFilter(
+  projectId: string,
+  name: string,
+  config: SavedFilter["config"],
+) {
+  return request<SavedFilter>(`/projects/${projectId}/filters`, {
+    method: "POST",
+    body: JSON.stringify({ name, config }),
+  });
+}
+
+export function deleteSavedFilter(projectId: string, filterId: string) {
+  return request<{ ok: boolean }>(`/projects/${projectId}/filters/${filterId}`, {
+    method: "DELETE",
+  });
 }
 
 export function downloadCsv(filename: string, rows: Record<string, unknown>[], columns: string[]) {

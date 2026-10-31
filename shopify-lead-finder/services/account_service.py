@@ -98,6 +98,9 @@ class Lead(Base):
     facebook = Column(String, nullable=True)
     tiktok = Column(String, nullable=True)
     linkedin = Column(String, nullable=True)
+    theme_name = Column(String, nullable=True)
+    theme_confidence = Column(String, nullable=True)
+    tracking_technologies = Column(Text, nullable=True)
     first_seen = Column(String, nullable=True)
     last_checked = Column(String, nullable=True)
     updated_at = Column(DateTime, nullable=True)
@@ -138,6 +141,54 @@ class ProcessedDomain(Base):
     discovery_source = Column(String, nullable=True)
     updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class StoreProduct(Base):
+    """Public catalog product linked to a saved store domain. Empty fields are unknown."""
+
+    __tablename__ = "store_products"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    run_id = Column(String, ForeignKey("discovery_runs.id"), nullable=True)
+    domain = Column(String, nullable=False)
+    shopify_product_id = Column(String, nullable=True)
+    title = Column(String, nullable=False)
+    handle = Column(String, nullable=True)
+    product_url = Column(String, nullable=True)
+    price = Column(String, nullable=True)
+    currency = Column(String, nullable=True)
+    image_url = Column(String, nullable=True)
+    category = Column(String, nullable=True)
+    first_seen = Column(String, nullable=True)
+    last_checked = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class WatchlistItem(Base):
+    """User-saved store domain for revisit / competitor tracking."""
+
+    __tablename__ = "watchlist_items"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    domain = Column(String, nullable=False)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=True)
+
+
+class SavedFilter(Base):
+    """Reusable discovery / research filter configuration."""
+
+    __tablename__ = "saved_filters"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    name = Column(String, nullable=False)
+    config_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=True)
 
 
 def database_url() -> str:
@@ -216,12 +267,43 @@ def handle(path: str, method: str, payload: dict | None, token: str | None):
 
 
 _ENGINE_LOCK = threading.Lock()
-_DB_SLOTS = threading.BoundedSemaphore(2)
+_DB_SLOTS: threading.BoundedSemaphore | None = None
+_DB_SLOTS_SIZE = 0
+
+
+def _max_db_sessions() -> int:
+    """
+    Cap open SQLAlchemy sessions per process.
+
+    Supabase session-mode poolers historically needed a hard 2.
+    Dedicated Render Postgres / local SQLite tolerate a few more so the
+    API can answer parallel Next.js requests while a worker process
+    (separate semaphore) flushes leads.
+    """
+    raw = (os.environ.get("ACCOUNT_DB_MAX_SESSIONS") or "").strip()
+    if raw.isdigit():
+        return max(1, min(int(raw), 16))
+    url = database_url()
+    if "pooler.supabase.com" in url or "supabase.co" in url:
+        return 2
+    return 4
+
+
+def _db_slots() -> threading.BoundedSemaphore:
+    global _DB_SLOTS, _DB_SLOTS_SIZE
+    size = _max_db_sessions()
+    if _DB_SLOTS is None or _DB_SLOTS_SIZE != size:
+        with _ENGINE_LOCK:
+            size = _max_db_sessions()
+            if _DB_SLOTS is None or _DB_SLOTS_SIZE != size:
+                _DB_SLOTS = threading.BoundedSemaphore(size)
+                _DB_SLOTS_SIZE = size
+    return _DB_SLOTS
 
 
 def reset_account_db_engine() -> None:
     """Test helper: drop the process-wide SQLAlchemy engine so a temp DB can be used."""
-    global _engine, _Session
+    global _engine, _Session, _DB_SLOTS, _DB_SLOTS_SIZE
     with _ENGINE_LOCK:
         if _engine is not None:
             try:
@@ -230,10 +312,12 @@ def reset_account_db_engine() -> None:
                 pass
         _engine = None
         _Session = None
+        _DB_SLOTS = None
+        _DB_SLOTS_SIZE = 0
 
 
 def _session(url: str):
-    """Open one database session. Never keep more than two of these at once."""
+    """Open one database session under the per-process session cap."""
     global _engine, _Session
     if _Session is None:
         with _ENGINE_LOCK:
@@ -249,12 +333,15 @@ def _session(url: str):
                 _ensure_phase_c_columns(engine)
                 _engine = engine
                 _Session = sessionmaker(bind=engine)
-    if not _DB_SLOTS.acquire(timeout=12):
+    slots = _db_slots()
+    wait_raw = (os.environ.get("ACCOUNT_DB_SESSION_WAIT_SECONDS") or "12").strip()
+    wait_seconds = float(wait_raw) if wait_raw.replace(".", "", 1).isdigit() else 12.0
+    if not slots.acquire(timeout=max(0.05, wait_seconds)):
         raise RuntimeError("The account database is busy. Wait a moment and try again.")
     try:
         session = _Session()
     except Exception:
-        _DB_SLOTS.release()
+        slots.release()
         raise
     original_close = session.close
     closed = False
@@ -267,7 +354,7 @@ def _session(url: str):
         try:
             original_close()
         finally:
-            _DB_SLOTS.release()
+            slots.release()
 
     session.close = close
     return session
@@ -327,6 +414,9 @@ _PHASE_C_LEAD_COLUMNS = {
     "facebook": "TEXT",
     "tiktok": "TEXT",
     "linkedin": "TEXT",
+    "theme_name": "TEXT",
+    "theme_confidence": "TEXT",
+    "tracking_technologies": "TEXT",
     "first_seen": "TEXT",
     "last_checked": "TEXT",
     "updated_at": "TIMESTAMP",
@@ -389,6 +479,135 @@ def _ensure_phase_c_columns(engine) -> None:
                                 discovery_source TEXT,
                                 updated_at TIMESTAMP,
                                 created_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+            if "store_products" not in tables:
+                if is_postgres:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS store_products (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL REFERENCES projects(id),
+                                user_id TEXT NOT NULL REFERENCES users(id),
+                                run_id TEXT REFERENCES discovery_runs(id),
+                                domain TEXT NOT NULL,
+                                shopify_product_id TEXT,
+                                title TEXT NOT NULL,
+                                handle TEXT,
+                                product_url TEXT,
+                                price TEXT,
+                                currency TEXT,
+                                image_url TEXT,
+                                category TEXT,
+                                first_seen TEXT,
+                                last_checked TEXT,
+                                created_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS store_products (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL,
+                                user_id TEXT NOT NULL,
+                                run_id TEXT,
+                                domain TEXT NOT NULL,
+                                shopify_product_id TEXT,
+                                title TEXT NOT NULL,
+                                handle TEXT,
+                                product_url TEXT,
+                                price TEXT,
+                                currency TEXT,
+                                image_url TEXT,
+                                category TEXT,
+                                first_seen TEXT,
+                                last_checked TEXT,
+                                created_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+                connection.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_store_products_project_domain "
+                        "ON store_products (project_id, domain)"
+                    )
+                )
+            if "watchlist_items" not in tables:
+                if is_postgres:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS watchlist_items (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL REFERENCES projects(id),
+                                user_id TEXT NOT NULL REFERENCES users(id),
+                                domain TEXT NOT NULL,
+                                note TEXT,
+                                created_at TIMESTAMP,
+                                updated_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS watchlist_items (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL,
+                                user_id TEXT NOT NULL,
+                                domain TEXT NOT NULL,
+                                note TEXT,
+                                created_at TIMESTAMP,
+                                updated_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+                connection.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_watchlist_project_domain "
+                        "ON watchlist_items (project_id, domain)"
+                    )
+                )
+            if "saved_filters" not in tables:
+                if is_postgres:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS saved_filters (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL REFERENCES projects(id),
+                                user_id TEXT NOT NULL REFERENCES users(id),
+                                name TEXT NOT NULL,
+                                config_json TEXT NOT NULL,
+                                created_at TIMESTAMP,
+                                updated_at TIMESTAMP
+                            )
+                            """
+                        )
+                    )
+                else:
+                    connection.execute(
+                        text(
+                            """
+                            CREATE TABLE IF NOT EXISTS saved_filters (
+                                id TEXT PRIMARY KEY,
+                                project_id TEXT NOT NULL,
+                                user_id TEXT NOT NULL,
+                                name TEXT NOT NULL,
+                                config_json TEXT NOT NULL,
+                                created_at TIMESTAMP,
+                                updated_at TIMESTAMP
                             )
                             """
                         )
@@ -540,6 +759,91 @@ def _route(session, path: str, method: str, payload: dict, token: str):
         row = _upsert_rejected_row(session, project.id, user.id, payload)
         session.commit()
         return {"id": row.id, "domain": row.domain}
+    products_match = re.fullmatch(r"/projects/([^/]+)/products", path)
+    if products_match and method == "GET":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, products_match.group(1))
+        rows = (
+            session.query(StoreProduct)
+            .filter(StoreProduct.project_id == project.id, StoreProduct.user_id == user.id)
+            .order_by(StoreProduct.domain.asc(), StoreProduct.title.asc())
+            .all()
+        )
+        return [_product_dict(row) for row in rows]
+    if products_match and method == "POST":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, products_match.group(1))
+        domain = str(payload.get("domain") or "").strip()
+        products = payload.get("products") if isinstance(payload.get("products"), list) else []
+        count = _replace_store_products(
+            session,
+            project.id,
+            user.id,
+            domain,
+            products,
+            run_id=payload.get("run_id"),
+        )
+        session.commit()
+        return {"domain": domain, "count": count}
+    compare_match = re.fullmatch(r"/projects/([^/]+)/compare", path)
+    if compare_match and method == "POST":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, compare_match.group(1))
+        return _compare_project_stores(session, project.id, user.id, payload or {})
+    watch_match = re.fullmatch(r"/projects/([^/]+)/watchlist", path)
+    if watch_match and method == "GET":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, watch_match.group(1))
+        rows = (
+            session.query(WatchlistItem)
+            .filter(WatchlistItem.project_id == project.id, WatchlistItem.user_id == user.id)
+            .order_by(WatchlistItem.created_at.desc())
+            .all()
+        )
+        return [_watchlist_dict(session, project.id, user.id, row) for row in rows]
+    if watch_match and method == "POST":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, watch_match.group(1))
+        row = _upsert_watchlist_item(session, project.id, user.id, payload or {})
+        session.commit()
+        return _watchlist_dict(session, project.id, user.id, row)
+    watch_one = re.fullmatch(r"/projects/([^/]+)/watchlist/([^/]+)", path)
+    if watch_one and method == "DELETE":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, watch_one.group(1))
+        row = session.get(WatchlistItem, watch_one.group(2))
+        if row is None or row.project_id != project.id or row.user_id != user.id:
+            raise RuntimeError("Watchlist item not found")
+        session.delete(row)
+        session.commit()
+        return {"ok": True}
+    filters_match = re.fullmatch(r"/projects/([^/]+)/filters", path)
+    if filters_match and method == "GET":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, filters_match.group(1))
+        rows = (
+            session.query(SavedFilter)
+            .filter(SavedFilter.project_id == project.id, SavedFilter.user_id == user.id)
+            .order_by(SavedFilter.created_at.desc())
+            .all()
+        )
+        return [_filter_dict(row) for row in rows]
+    if filters_match and method == "POST":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, filters_match.group(1))
+        row = _create_saved_filter(session, project.id, user.id, payload or {})
+        session.commit()
+        return _filter_dict(row)
+    filter_one = re.fullmatch(r"/projects/([^/]+)/filters/([^/]+)", path)
+    if filter_one and method == "DELETE":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, filter_one.group(1))
+        row = session.get(SavedFilter, filter_one.group(2))
+        if row is None or row.project_id != project.id or row.user_id != user.id:
+            raise RuntimeError("Saved filter not found")
+        session.delete(row)
+        session.commit()
+        return {"ok": True}
     raise RuntimeError(f"Unsupported account request: {method} {path}")
 
 
@@ -607,7 +911,9 @@ def _run_public(run: DiscoveryRun) -> dict:
             result = {}
     return {
         "id": run.id,
+        "name": run.name or "",
         "status": run.status,
+        "max_domains": int(run.max_domains or 0),
         "log": run.log_text or "",
         "summary": run.summary or "",
         "error": run.error or "",
@@ -927,6 +1233,16 @@ def flush_durable_batch(
             payload = dict(item)
             payload["run_id"] = payload.get("run_id") or run_id
             _upsert_lead_row(session, project.id, user_id, payload)
+            products = payload.get("products")
+            if isinstance(products, list):
+                _replace_store_products(
+                    session,
+                    project.id,
+                    user_id,
+                    str(payload.get("domain") or ""),
+                    products,
+                    run_id=payload.get("run_id") or run_id,
+                )
         for item in rejected or []:
             payload = dict(item)
             payload["run_id"] = payload.get("run_id") or run_id
@@ -983,6 +1299,14 @@ def _upsert_lead_row(session, project_id: str, user_id: str, payload: dict) -> L
     row.facebook = _prefer(row.facebook, payload.get("facebook"))
     row.tiktok = _prefer(row.tiktok, payload.get("tiktok"))
     row.linkedin = _prefer(row.linkedin, payload.get("linkedin"))
+    row.theme_name = _prefer(row.theme_name, payload.get("theme_name"))
+    row.theme_confidence = _prefer(row.theme_confidence, payload.get("theme_confidence"))
+    tracking = payload.get("tracking_technologies")
+    if tracking is not None:
+        if isinstance(tracking, (list, dict)):
+            row.tracking_technologies = json.dumps(tracking, default=str)
+        else:
+            row.tracking_technologies = _prefer(row.tracking_technologies, tracking)
     row.last_checked = payload.get("last_checked") or now.isoformat()
     row.updated_at = now
     return row
@@ -1021,6 +1345,53 @@ def _upsert_rejected_row(session, project_id: str, user_id: str, payload: dict) 
     row.last_checked = payload.get("last_checked") or now.isoformat()
     row.updated_at = now
     return row
+
+
+def _replace_store_products(
+    session,
+    project_id: str,
+    user_id: str,
+    domain: str,
+    products: list,
+    run_id: str | None = None,
+) -> int:
+    """Replace this project's catalog snapshot for a domain. Incomplete fields stay empty."""
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    session.query(StoreProduct).filter(
+        StoreProduct.project_id == project_id,
+        StoreProduct.user_id == user_id,
+        StoreProduct.domain == domain_key,
+    ).delete(synchronize_session=False)
+    saved = 0
+    for item in products or []:
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title") or "").split())
+        if len(title) < 2:
+            continue
+        session.add(
+            StoreProduct(
+                project_id=project_id,
+                user_id=user_id,
+                run_id=run_id or None,
+                domain=domain_key,
+                shopify_product_id=str(item.get("shopify_product_id") or "") or None,
+                title=title,
+                handle=str(item.get("handle") or "") or None,
+                product_url=str(item.get("product_url") or "") or None,
+                price=str(item.get("price") or "") or None,
+                currency=str(item.get("currency") or "") or None,
+                image_url=str(item.get("image_url") or "") or None,
+                category=str(item.get("category") or "") or None,
+                first_seen=now,
+                last_checked=now,
+            )
+        )
+        saved += 1
+    return saved
 
 
 def _upsert_processed_row(session, project_id: str, user_id: str, payload: dict) -> ProcessedDomain:
@@ -1085,6 +1456,19 @@ def _password_ok(password: str, password_hash: str) -> bool:
         return False
 
 
+def assert_user_exists(user_id: str) -> str:
+    """Cheap auth probe for the FastAPI JWT path. Streamlit still uses handle()."""
+    url = database_url()
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    session = _session(url)
+    try:
+        user = _require_user(session, user_id)
+        return user.id
+    finally:
+        session.close()
+
+
 def _require_user(session, token: str) -> User:
     user = session.get(User, token) if token else None
     if user is None:
@@ -1100,6 +1484,15 @@ def _owned_project(session, user_id: str, project_id: str) -> Project:
 
 
 def _lead_dict(row: Lead) -> dict:
+    tracking: list = []
+    raw = row.tracking_technologies
+    if raw:
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, list):
+                tracking = parsed
+        except json.JSONDecodeError:
+            tracking = []
     return {
         "id": row.id,
         "domain": row.domain,
@@ -1108,7 +1501,151 @@ def _lead_dict(row: Lead) -> dict:
         "country": row.country,
         "freshness_level": row.freshness_level,
         "freshness_score": row.freshness_score,
+        "freshness_evidence": row.freshness_evidence or "",
         "source": row.source,
+        "theme_name": row.theme_name or "",
+        "theme_confidence": row.theme_confidence or "",
+        "tracking_technologies": tracking,
+        "first_seen": row.first_seen or "",
+        "last_checked": row.last_checked or "",
+    }
+
+
+def _compare_project_stores(session, project_id: str, user_id: str, payload: dict) -> dict:
+    from research.compare_stores import compare_stores
+
+    domain_a = str(payload.get("domain_a") or payload.get("a") or "").strip()
+    domain_b = str(payload.get("domain_b") or payload.get("b") or "").strip()
+    if not domain_a or not domain_b:
+        raise RuntimeError("domain_a and domain_b are required")
+    if domain_a == domain_b:
+        raise RuntimeError("Choose two different stores to compare")
+
+    lead_a = (
+        session.query(Lead)
+        .filter(Lead.project_id == project_id, Lead.user_id == user_id, Lead.domain == domain_a)
+        .first()
+    )
+    lead_b = (
+        session.query(Lead)
+        .filter(Lead.project_id == project_id, Lead.user_id == user_id, Lead.domain == domain_b)
+        .first()
+    )
+    if lead_a is None or lead_b is None:
+        missing = []
+        if lead_a is None:
+            missing.append(domain_a)
+        if lead_b is None:
+            missing.append(domain_b)
+        raise RuntimeError("Store not found in project leads: " + ", ".join(missing))
+
+    products_a = [
+        _product_dict(row)
+        for row in session.query(StoreProduct)
+        .filter(
+            StoreProduct.project_id == project_id,
+            StoreProduct.user_id == user_id,
+            StoreProduct.domain == domain_a,
+        )
+        .all()
+    ]
+    products_b = [
+        _product_dict(row)
+        for row in session.query(StoreProduct)
+        .filter(
+            StoreProduct.project_id == project_id,
+            StoreProduct.user_id == user_id,
+            StoreProduct.domain == domain_b,
+        )
+        .all()
+    ]
+    return compare_stores(_lead_dict(lead_a), _lead_dict(lead_b), products_a, products_b)
+
+
+def _upsert_watchlist_item(session, project_id: str, user_id: str, payload: dict) -> WatchlistItem:
+    domain = str(payload.get("domain") or "").strip()
+    if not domain:
+        raise RuntimeError("domain is required")
+    now = datetime.now(timezone.utc)
+    row = (
+        session.query(WatchlistItem)
+        .filter(
+            WatchlistItem.project_id == project_id,
+            WatchlistItem.user_id == user_id,
+            WatchlistItem.domain == domain,
+        )
+        .first()
+    )
+    if row is None:
+        row = WatchlistItem(project_id=project_id, user_id=user_id, domain=domain)
+        session.add(row)
+    note = payload.get("note")
+    if note is not None:
+        row.note = str(note).strip() or None
+    row.updated_at = now
+    return row
+
+
+def _watchlist_dict(session, project_id: str, user_id: str, row: WatchlistItem) -> dict:
+    lead = (
+        session.query(Lead)
+        .filter(Lead.project_id == project_id, Lead.user_id == user_id, Lead.domain == row.domain)
+        .first()
+    )
+    product_count = (
+        session.query(StoreProduct)
+        .filter(
+            StoreProduct.project_id == project_id,
+            StoreProduct.user_id == user_id,
+            StoreProduct.domain == row.domain,
+        )
+        .count()
+    )
+    return {
+        "id": row.id,
+        "domain": row.domain,
+        "note": row.note or "",
+        "created_at": _iso(row.created_at),
+        "updated_at": _iso(row.updated_at),
+        "lead": _lead_dict(lead) if lead else None,
+        "product_count": int(product_count or 0),
+    }
+
+
+def _create_saved_filter(session, project_id: str, user_id: str, payload: dict) -> SavedFilter:
+    name = " ".join(str(payload.get("name") or "").split())
+    if len(name) < 1:
+        raise RuntimeError("name is required")
+    config = payload.get("config")
+    if config is None:
+        config = payload.get("settings") or {}
+    if not isinstance(config, dict):
+        raise RuntimeError("config must be an object")
+    now = datetime.now(timezone.utc)
+    row = SavedFilter(
+        project_id=project_id,
+        user_id=user_id,
+        name=name,
+        config_json=json.dumps(config, default=str),
+        updated_at=now,
+    )
+    session.add(row)
+    return row
+
+
+def _filter_dict(row: SavedFilter) -> dict:
+    try:
+        config = json.loads(row.config_json or "{}")
+    except json.JSONDecodeError:
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    return {
+        "id": row.id,
+        "name": row.name,
+        "config": config,
+        "created_at": _iso(row.created_at),
+        "updated_at": _iso(row.updated_at),
     }
 
 
@@ -1119,6 +1656,21 @@ def _rejected_dict(row: RejectedCandidate) -> dict:
         "store_name": row.store_name,
         "public_email": row.public_email,
         "reason": row.reason,
+    }
+
+
+def _product_dict(row: StoreProduct) -> dict:
+    return {
+        "id": row.id,
+        "domain": row.domain,
+        "shopify_product_id": row.shopify_product_id or "",
+        "title": row.title,
+        "handle": row.handle or "",
+        "product_url": row.product_url or "",
+        "price": row.price or "",
+        "currency": row.currency or "",
+        "image_url": row.image_url or "",
+        "category": row.category or "",
     }
 
 

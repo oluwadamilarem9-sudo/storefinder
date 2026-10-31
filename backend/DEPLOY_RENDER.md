@@ -12,6 +12,8 @@ Data move: [`docs/PRODUCTION_DATA_MIGRATION.md`](../docs/PRODUCTION_DATA_MIGRATI
 - Health: `GET /health`
 - `START_DISCOVERY_WORKERS=0` on Render so only `worker.py` claims runs.
 - `JWT_SECRET_KEY` must be set (Blueprint `generateValue`). The API refuses the local fallback when `RENDER` is set.
+- Bearer auth is **JWT only** (opaque user-id tokens are rejected). Streamlit auth stays on `account_db.handle`.
+- `ACCOUNT_DB_MAX_SESSIONS=4` on API and worker for the dedicated Render Postgres.
 
 Smoke test (after deploy):
 

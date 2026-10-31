@@ -257,6 +257,46 @@ class NewStoreResult:
     age_days: int | None = None
 
 
+# User-facing store-age filter values (run settings / UI).
+STORE_AGE_ALL = "all"
+STORE_AGE_NEW = "new"
+STORE_AGE_ESTABLISHED = "established"
+STORE_AGE_UNKNOWN = "unknown"
+STORE_AGE_FILTERS = (
+    STORE_AGE_ALL,
+    STORE_AGE_NEW,
+    STORE_AGE_ESTABLISHED,
+    STORE_AGE_UNKNOWN,
+)
+
+
+def normalize_store_age_filter(value: str | None) -> str:
+    text = (value or STORE_AGE_ALL).strip().lower()
+    return text if text in STORE_AGE_FILTERS else STORE_AGE_ALL
+
+
+def classify_store_age(result: NewStoreResult) -> str:
+    """
+    Map public age evidence to new / established / unknown.
+
+    Never invents a creation date. UNKNOWN means public records did not
+    prove new or established within the configured windows.
+    """
+    if result.is_new:
+        return STORE_AGE_NEW
+    if (result.freshness_level or "").upper() == "UNKNOWN":
+        return STORE_AGE_UNKNOWN
+    return STORE_AGE_ESTABLISHED
+
+
+def age_filter_allows(store_age: str, wanted: str) -> bool:
+    """Return True when this shop matches the run's store-age filter."""
+    filter_value = normalize_store_age_filter(wanted)
+    if filter_value == STORE_AGE_ALL:
+        return True
+    return store_age == filter_value
+
+
 def judge_new_store(
     *,
     rdap_created: datetime | None,

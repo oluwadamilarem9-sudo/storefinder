@@ -3,8 +3,9 @@ StoreFinder HTTP API.
 
 Phase 1B: routes delegate account business logic to
 ``services.account_service`` (same layer Streamlit/workers use).
-JWT is issued for API clients; opaque user-id tokens still work so
-Streamlit-style tokens are not rejected during the transition.
+HTTP clients (Next.js) must use JWT bearer tokens. Opaque user-id
+bearers are rejected here. Streamlit keeps using ``account_db.handle``
+with the user id directly and does not depend on this FastAPI auth path.
 """
 
 from __future__ import annotations
@@ -108,6 +109,21 @@ class RejectedCreateRequest(BaseModel):
     run_id: str | None = None
 
 
+class CompareRequest(BaseModel):
+    domain_a: str
+    domain_b: str
+
+
+class WatchlistCreateRequest(BaseModel):
+    domain: str
+    note: str | None = None
+
+
+class SavedFilterCreateRequest(BaseModel):
+    name: str
+    config: dict | None = None
+
+
 def get_db_url(db_path: str | None = None) -> str:
     if db_path:
         return f"sqlite:///{Path(db_path).resolve().as_posix()}"
@@ -198,24 +214,35 @@ def create_app(db_path: str | None = None, *, start_workers: bool | None = None)
     def get_current_user_id(
         auth: HTTPAuthorizationCredentials = Depends(security),
     ) -> str:
-        """Accept JWT (API) or opaque user-id token (Streamlit account_db style)."""
+        """Require a valid JWT. Opaque user-id bearers are not accepted on this API."""
+        from services import account_service
+
         token = (auth.credentials or "").strip()
         if not token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
 
-        user_id: str | None = None
         try:
             payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            user_id = str(payload.get("sub") or "").strip() or None
-        except jwt.PyJWTError:
-            user_id = None
+        except jwt.PyJWTError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token",
+            ) from exc
 
+        user_id = str(payload.get("sub") or "").strip()
         if not user_id:
-            # Opaque Streamlit-style token: raw users.id
-            user_id = token
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-        # Prove the user exists / token is usable against the shared service.
-        _service_call("/projects", "GET", None, user_id)
+        try:
+            account_service.assert_user_exists(user_id)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "sign in first" in message.lower():
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=message,
+                ) from exc
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message) from exc
         return user_id
 
     @app.post("/auth/signup")
@@ -249,6 +276,18 @@ def create_app(db_path: str | None = None, *, start_workers: bool | None = None)
 
     @app.post("/auth/device")
     def device_login(payload: DeviceLoginRequest):
+        """Disabled by default. Next.js uses /auth/signup and /auth/login only."""
+        enabled = (os.getenv("ENABLE_DEVICE_AUTH") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not enabled:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Device auth is disabled",
+            )
         device_id = (payload.device_id or "").strip()
         if not device_id:
             raise HTTPException(status_code=400, detail="device_id is required")
@@ -340,6 +379,83 @@ def create_app(db_path: str | None = None, *, start_workers: bool | None = None)
     @app.get("/projects/{project_id}/rejected")
     def list_rejected(project_id: str, user_id: str = Depends(get_current_user_id)):
         return _service_call(f"/projects/{project_id}/rejected", "GET", None, user_id)
+
+    @app.get("/projects/{project_id}/products")
+    def list_products(project_id: str, user_id: str = Depends(get_current_user_id)):
+        return _service_call(f"/projects/{project_id}/products", "GET", None, user_id)
+
+    @app.post("/projects/{project_id}/compare")
+    def compare_stores(
+        project_id: str,
+        payload: CompareRequest,
+        user_id: str = Depends(get_current_user_id),
+    ):
+        return _service_call(
+            f"/projects/{project_id}/compare",
+            "POST",
+            payload.model_dump(),
+            user_id,
+        )
+
+    @app.get("/projects/{project_id}/watchlist")
+    def list_watchlist(project_id: str, user_id: str = Depends(get_current_user_id)):
+        return _service_call(f"/projects/{project_id}/watchlist", "GET", None, user_id)
+
+    @app.post("/projects/{project_id}/watchlist")
+    def add_watchlist(
+        project_id: str,
+        payload: WatchlistCreateRequest,
+        user_id: str = Depends(get_current_user_id),
+    ):
+        return _service_call(
+            f"/projects/{project_id}/watchlist",
+            "POST",
+            payload.model_dump(),
+            user_id,
+        )
+
+    @app.delete("/projects/{project_id}/watchlist/{item_id}")
+    def remove_watchlist(
+        project_id: str,
+        item_id: str,
+        user_id: str = Depends(get_current_user_id),
+    ):
+        return _service_call(
+            f"/projects/{project_id}/watchlist/{item_id}",
+            "DELETE",
+            None,
+            user_id,
+        )
+
+    @app.get("/projects/{project_id}/filters")
+    def list_filters(project_id: str, user_id: str = Depends(get_current_user_id)):
+        return _service_call(f"/projects/{project_id}/filters", "GET", None, user_id)
+
+    @app.post("/projects/{project_id}/filters")
+    def create_filter(
+        project_id: str,
+        payload: SavedFilterCreateRequest,
+        user_id: str = Depends(get_current_user_id),
+    ):
+        return _service_call(
+            f"/projects/{project_id}/filters",
+            "POST",
+            payload.model_dump(),
+            user_id,
+        )
+
+    @app.delete("/projects/{project_id}/filters/{filter_id}")
+    def delete_filter(
+        project_id: str,
+        filter_id: str,
+        user_id: str = Depends(get_current_user_id),
+    ):
+        return _service_call(
+            f"/projects/{project_id}/filters/{filter_id}",
+            "DELETE",
+            None,
+            user_id,
+        )
 
     return app
 

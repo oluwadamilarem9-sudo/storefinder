@@ -92,6 +92,7 @@ def execute_run(job: dict) -> None:
         enable_secondary=bool(settings.get("enable_secondary")),
         target_countries=countries,
         keep_unknown_country=bool(settings.get("keep_unknown_country")),
+        store_age_filter=str(settings.get("store_age_filter") or "all"),
         db_path=paths["db"],
         leads_csv=paths["leads_csv"],
         rejected_csv=paths["rejected_csv"],
@@ -181,27 +182,55 @@ def _clean_cell(value):
 
 
 def _store_rows(db_path, job: dict, lead_domains: list[str], rejected_domains: list[str]) -> None:
+    from database.database import load_store_products
+
     connection = connect(db_path)
     try:
         leads_df = load_leads_frame(connection)
         rejected_df = load_rejected_frame(connection)
+        product_rows = load_store_products(connection, list(lead_domains) if lead_domains else [])
     finally:
         connection.close()
+    products_by_domain: dict[str, list[dict]] = {}
+    for item in product_rows:
+        domain = str(item.get("domain") or "").strip()
+        if not domain:
+            continue
+        products_by_domain.setdefault(domain, []).append(
+            {
+                "shopify_product_id": item.get("shopify_product_id") or "",
+                "title": item.get("title") or "",
+                "handle": item.get("handle") or "",
+                "product_url": item.get("product_url") or "",
+                "price": item.get("price") or "",
+                "currency": item.get("currency") or "",
+                "image_url": item.get("image_url") or "",
+                "category": item.get("category") or "",
+            }
+        )
     lead_set = set(lead_domains)
     rejected_set = set(rejected_domains)
     leads = []
     if lead_set and not leads_df.empty and "domain" in leads_df.columns:
         picked = leads_df[leads_df["domain"].astype(str).isin(lead_set)]
         for _, row in picked.iterrows():
+            domain = str(row.get("domain") or "")
             leads.append(
                 {
-                    "domain": str(row.get("domain") or ""),
+                    "domain": domain,
                     "store_name": _clean_cell(row.get("store_name")),
                     "public_email": _clean_cell(row.get("public_email")),
                     "country": _clean_cell(row.get("country")),
                     "freshness_level": _clean_cell(row.get("freshness_level")),
                     "freshness_score": int(row.get("freshness_score") or 0),
+                    "freshness_evidence": _clean_cell(row.get("freshness_evidence")),
                     "source": _clean_cell(row.get("discovery_source")),
+                    "theme_name": _clean_cell(row.get("theme_name")),
+                    "theme_confidence": _clean_cell(row.get("theme_confidence")),
+                    "tracking_technologies": _clean_cell(row.get("tracking_technologies")) or "[]",
+                    "first_seen": _clean_cell(row.get("first_seen")),
+                    "last_checked": _clean_cell(row.get("last_checked")),
+                    "products": products_by_domain.get(domain, []),
                 }
             )
     rejected = []

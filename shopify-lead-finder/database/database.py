@@ -8,6 +8,7 @@ again and again in later cycles.
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from pathlib import Path
 from threading import RLock
 
@@ -44,6 +45,9 @@ LEAD_COLUMNS = [
     "freshness_score",
     "freshness_evidence",
     "country",
+    "theme_name",
+    "theme_confidence",
+    "tracking_technologies",
     "contact_page",
     "about_page",
     "instagram",
@@ -113,6 +117,9 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             freshness_score INTEGER,
             freshness_level TEXT,
             freshness_evidence TEXT,
+            theme_name TEXT,
+            theme_confidence TEXT,
+            tracking_technologies TEXT,
             estimated_newness TEXT,
             newness_confidence TEXT
         );
@@ -131,6 +138,22 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             first_seen TEXT NOT NULL,
             last_checked TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS store_products (
+            id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            shopify_product_id TEXT,
+            title TEXT NOT NULL,
+            handle TEXT,
+            product_url TEXT,
+            price TEXT,
+            currency TEXT,
+            image_url TEXT,
+            category TEXT,
+            first_seen TEXT NOT NULL,
+            last_checked TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_store_products_domain ON store_products(domain);
         """
     )
     connection.commit()
@@ -143,6 +166,9 @@ def _migrate_leads(connection: sqlite3.Connection) -> None:
         "freshness_score": "INTEGER",
         "freshness_level": "TEXT",
         "freshness_evidence": "TEXT",
+        "theme_name": "TEXT",
+        "theme_confidence": "TEXT",
+        "tracking_technologies": "TEXT",
     }
     for name, typ in additions.items():
         if name not in columns:
@@ -328,8 +354,9 @@ def upsert_lead(connection: sqlite3.Connection, lead: dict) -> None:
             domain, store_name, shopify_status, public_email, contact_page, about_page,
             instagram, facebook, tiktok, linkedin, youtube, country, discovery_source,
             source_url, discovered_at, first_seen, last_checked, freshness_score,
-            freshness_level, freshness_evidence
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            freshness_level, freshness_evidence, theme_name, theme_confidence,
+            tracking_technologies
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(domain) DO UPDATE SET
             store_name = excluded.store_name,
             shopify_status = excluded.shopify_status,
@@ -347,7 +374,10 @@ def upsert_lead(connection: sqlite3.Connection, lead: dict) -> None:
             last_checked = excluded.last_checked,
             freshness_score = excluded.freshness_score,
             freshness_level = excluded.freshness_level,
-            freshness_evidence = excluded.freshness_evidence
+            freshness_evidence = excluded.freshness_evidence,
+            theme_name = excluded.theme_name,
+            theme_confidence = excluded.theme_confidence,
+            tracking_technologies = excluded.tracking_technologies
         """,
         (
             lead.get("domain", ""),
@@ -370,6 +400,9 @@ def upsert_lead(connection: sqlite3.Connection, lead: dict) -> None:
             lead.get("freshness_score", 0),
             lead.get("freshness_level", "UNKNOWN"),
             lead.get("freshness_evidence", ""),
+            lead.get("theme_name", ""),
+            lead.get("theme_confidence", ""),
+            lead.get("tracking_technologies", ""),
         ),
     )
     mark_processed(
@@ -379,6 +412,78 @@ def upsert_lead(connection: sqlite3.Connection, lead: dict) -> None:
         lead.get("discovery_source", ""),
     )
     connection.commit()
+
+
+@_db_locked
+def upsert_store_products(connection: sqlite3.Connection, domain: str, products: list[dict]) -> int:
+    """Replace this domain's public catalog snapshot with the latest fetch."""
+    domain_key = str(domain or "").strip()
+    if not domain_key:
+        return 0
+    timestamp = now_iso()
+    connection.execute("DELETE FROM store_products WHERE domain = ?", (domain_key,))
+    saved = 0
+    for item in products or []:
+        title = " ".join(str((item or {}).get("title") or "").split())
+        if len(title) < 2:
+            continue
+        connection.execute(
+            """
+            INSERT INTO store_products (
+                id, domain, shopify_product_id, title, handle, product_url,
+                price, currency, image_url, category, first_seen, last_checked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                domain_key,
+                str(item.get("shopify_product_id") or ""),
+                title,
+                str(item.get("handle") or ""),
+                str(item.get("product_url") or ""),
+                str(item.get("price") or ""),
+                str(item.get("currency") or ""),
+                str(item.get("image_url") or ""),
+                str(item.get("category") or ""),
+                timestamp,
+                timestamp,
+            ),
+        )
+        saved += 1
+    connection.commit()
+    return saved
+
+
+def load_store_products(
+    connection: sqlite3.Connection,
+    domains: list[str] | None = None,
+) -> list[dict]:
+    """Return stored catalog products, optionally limited to domains."""
+    if domains is not None:
+        wanted = [str(item).strip() for item in domains if str(item).strip()]
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        rows = connection.execute(
+            f"""
+            SELECT id, domain, shopify_product_id, title, handle, product_url,
+                   price, currency, image_url, category, first_seen, last_checked
+            FROM store_products
+            WHERE domain IN ({placeholders})
+            ORDER BY domain ASC, title ASC
+            """,
+            wanted,
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            """
+            SELECT id, domain, shopify_product_id, title, handle, product_url,
+                   price, currency, image_url, category, first_seen, last_checked
+            FROM store_products
+            ORDER BY domain ASC, title ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 @_db_locked
@@ -499,7 +604,8 @@ def export_csv(connection: sqlite3.Connection, path: Path | None = None) -> Path
     rows = connection.execute(
         """
         SELECT store_name, domain, public_email, shopify_status, freshness_level,
-               freshness_score, freshness_evidence, country, contact_page, about_page,
+               freshness_score, freshness_evidence, country, theme_name, theme_confidence,
+               tracking_technologies, contact_page, about_page,
                instagram, facebook, tiktok, linkedin, discovery_source, source_url,
                first_seen, last_checked
         FROM leads
@@ -523,7 +629,8 @@ def load_leads_frame(connection: sqlite3.Connection) -> pd.DataFrame:
     rows = connection.execute(
         """
         SELECT store_name, domain, public_email, shopify_status, freshness_level,
-               freshness_score, freshness_evidence, country, contact_page, about_page,
+               freshness_score, freshness_evidence, country, theme_name, theme_confidence,
+               tracking_technologies, contact_page, about_page,
                instagram, facebook, tiktok, linkedin, discovery_source, source_url,
                first_seen, last_checked
         FROM leads

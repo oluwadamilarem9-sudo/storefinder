@@ -28,6 +28,10 @@ services:
         generateValue: true
       - key: START_DISCOVERY_WORKERS
         value: "0"
+      - key: STOREFINDER_ENV
+        value: "production"
+      - key: ACCOUNT_DB_MAX_SESSIONS
+        value: "4"
       - key: WEB_ORIGIN_HOST
         fromService:
           name: storefinder-web
@@ -52,6 +56,10 @@ services:
           property: connectionString
       - key: WORKER_SLOTS
         value: "2"
+      - key: ACCOUNT_DB_MAX_SESSIONS
+        value: "4"
+      - key: STOREFINDER_ENV
+        value: "production"
 
   # Next.js SaaS UI.
   - type: web
