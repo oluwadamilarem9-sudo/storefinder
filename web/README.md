@@ -13,12 +13,8 @@ $env:CORS_ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
 python -m uvicorn backend.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
-2. Optional: start a discovery worker in another terminal (same `DATABASE_URL`) so queued runs execute:
-
-```powershell
-cd shopify-lead-finder
-python worker.py
-```
+2. The API starts the existing discovery worker pool on boot (same `pipeline` / `discovery_worker` code).  
+   Set `START_DISCOVERY_WORKERS=0` to disable, or run extra `python worker.py` processes to add capacity.
 
 3. Start the web app:
 

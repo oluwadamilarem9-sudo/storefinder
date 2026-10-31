@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -122,10 +123,32 @@ def _service_call(path: str, method: str, payload: dict | None, token: str | Non
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message) from exc
 
 
-def create_app(db_path: str | None = None) -> FastAPI:
-    _bind_account_database(db_path)
+def _should_start_discovery_workers(db_path: str | None, start_workers: bool | None) -> bool:
+    """Queued Next.js runs need claim_next_run workers; tests with temp DBs do not."""
+    if start_workers is not None:
+        return start_workers
+    if db_path is not None:
+        return False
+    flag = (os.getenv("START_DISCOVERY_WORKERS") or "1").strip().lower()
+    return flag not in {"0", "false", "no", "off"}
 
-    app = FastAPI(title="StoreFinder Backend")
+
+def create_app(db_path: str | None = None, *, start_workers: bool | None = None) -> FastAPI:
+    _bind_account_database(db_path)
+    enable_workers = _should_start_discovery_workers(db_path, start_workers)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if enable_workers:
+            # Keep the existing discovery_worker / pipeline path; just start it here
+            # so queued SaaS runs are claimed without a separate worker.py process.
+            os.environ.setdefault("WORKER_SLOTS", "2")
+            from discovery_worker import start_worker_pool
+
+            start_worker_pool()
+        yield
+
+    app = FastAPI(title="StoreFinder Backend", lifespan=lifespan)
     allowed_origins_env = os.getenv("CORS_ALLOWED_ORIGINS")
     if allowed_origins_env:
         origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]

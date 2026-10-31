@@ -157,7 +157,8 @@ export default function ProjectDetailPage() {
           </button>
         </form>
         <p style={{ color: "var(--muted)", margin: 0 }}>
-          Runs are queued for a worker (`python worker.py` with the same local DATABASE_URL).
+          Runs are queued and claimed by the API discovery workers (same engine as{" "}
+          <code>worker.py</code>). Status and the activity log update as the cycle runs.
         </p>
       </section>
 
