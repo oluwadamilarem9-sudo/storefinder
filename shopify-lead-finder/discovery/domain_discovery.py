@@ -19,6 +19,7 @@ from discovery.discovery_sources import (
     active_sources,
     fallback_sources,
 )
+from utils.console import safe_print
 from utils.normalization import normalize_domain
 
 LogFn = Callable[[str], None]
@@ -40,7 +41,7 @@ def discover_candidates(
     discovered: list[DiscoveredCandidate] = []
 
     def log(message: str) -> None:
-        print(message)
+        safe_print(message)
         if on_log:
             on_log(message)
 

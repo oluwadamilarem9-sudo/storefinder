@@ -14,6 +14,7 @@ import time
 import config
 import account_db
 from database.database import connect, load_leads_frame, load_rejected_frame, remember_domains, upsert_rejected
+from utils.console import safe_print as print
 
 _STARTED = False
 _START_LOCK = threading.Lock()
@@ -71,6 +72,11 @@ def execute_run(job: dict) -> None:
             account_db.save_run_log(job["id"], "\n".join(lines[-80:]))
             last_flush = now
 
+    def on_heartbeat() -> None:
+        account_db.touch_run(job["id"])
+        if lines:
+            account_db.save_run_log(job["id"], "\n".join(lines[-80:]))
+
     on_log("Cycle started. Searching public sources for shops on their own domain.")
     on_log("Loading websites already checked for this project.")
     _seed_history(paths["db"], str(job["project_id"]), user_id=str(job["user_id"]))
@@ -81,6 +87,7 @@ def execute_run(job: dict) -> None:
         countries = None
     result = run_cycle(
         on_log=on_log,
+        on_heartbeat=on_heartbeat,
         max_domains=int(job.get("max_domains") or settings.get("max_domains") or 20),
         enable_secondary=bool(settings.get("enable_secondary")),
         target_countries=countries,

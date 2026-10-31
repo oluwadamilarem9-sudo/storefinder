@@ -57,12 +57,14 @@ export default function ProjectDetailPage() {
     });
   }, [load]);
 
+  // Poll activity while a cycle is queued/running.
   useEffect(() => {
     if (!selectedRun || (selectedRun.status !== "queued" && selectedRun.status !== "running")) {
       return;
     }
+    const runId = selectedRun.id;
     const timer = setInterval(() => {
-      getRun(projectId, selectedRun.id)
+      getRun(projectId, runId)
         .then((detail) => {
           setSelectedRun(detail);
           setRuns((current) =>
@@ -72,7 +74,27 @@ export default function ProjectDetailPage() {
         .catch(() => undefined);
     }, 4000);
     return () => clearInterval(timer);
-  }, [projectId, selectedRun]);
+  }, [projectId, selectedRun?.id, selectedRun?.status]);
+
+  // Worker copies qualifying rows into the account DB when the cycle ends.
+  // Reload leads/rejected then; polling alone only refreshed the activity log.
+  useEffect(() => {
+    if (!selectedRun || selectedRun.status === "queued" || selectedRun.status === "running") {
+      return;
+    }
+    let cancelled = false;
+    Promise.all([listLeads(projectId), listRejected(projectId), listRuns(projectId)])
+      .then(([leadRows, rejectedRows, runRows]) => {
+        if (cancelled) return;
+        setLeads(leadRows);
+        setRejected(rejectedRows);
+        setRuns(runRows);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, selectedRun?.id, selectedRun?.status]);
 
   const filteredLeads = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -173,14 +195,28 @@ export default function ProjectDetailPage() {
         <button
           type="button"
           className={tab === "leads" ? "btn" : "btn secondary"}
-          onClick={() => setTab("leads")}
+          onClick={() => {
+            setTab("leads");
+            listLeads(projectId)
+              .then(setLeads)
+              .catch((err) =>
+                setError(err instanceof ApiError ? err.message : "Could not load leads"),
+              );
+          }}
         >
           Leads ({leads.length})
         </button>
         <button
           type="button"
           className={tab === "rejected" ? "btn" : "btn secondary"}
-          onClick={() => setTab("rejected")}
+          onClick={() => {
+            setTab("rejected");
+            listRejected(projectId)
+              .then(setRejected)
+              .catch((err) =>
+                setError(err instanceof ApiError ? err.message : "Could not load rejected"),
+              );
+          }}
         >
           Rejected ({rejected.length})
         </button>

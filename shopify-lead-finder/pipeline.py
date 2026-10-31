@@ -30,6 +30,7 @@ from detection.storefront_profile import inspect_storefront, is_password_page, p
 from discovery.candidate_manager import prepare_candidates
 from discovery.discovery_sources import DiscoveredCandidate, active_sources
 from discovery.domain_discovery import discover_candidates
+from utils.console import safe_print
 from utils.countries import country_allows, country_label, normalize_country
 from utils.http import fetch_public
 from utils.normalization import is_junk_store_domain, is_usable_shop_domain, normalize_domain, now_iso, website_url
@@ -75,7 +76,8 @@ def run_cycle(
     secondary = config.ENABLE_SECONDARY_SOURCES if enable_secondary is None else enable_secondary
 
     def log(message: str) -> None:
-        print(message)
+        # Never let Windows console encoding abort a live cycle mid-check.
+        safe_print(message)
         if on_log:
             on_log(message)
 
@@ -321,6 +323,7 @@ def run_cycle(
         cycle_sources = active_sources(enable_secondary=secondary)
         while stats["checked"] < max_domains and not stats.get("slowed_down"):
             remaining = max_domains - stats["checked"]
+            beat()
             raw_candidates = discover_candidates(
                 limit_per_source=remaining,
                 on_log=log,
@@ -328,6 +331,7 @@ def run_cycle(
                 min_unused=remaining,
                 sources=cycle_sources,
             )
+            beat()
             stats["candidates"] += len(raw_candidates)
             if not raw_candidates:
                 log("No candidates came back from any public source this pass.")

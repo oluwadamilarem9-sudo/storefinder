@@ -28,6 +28,7 @@ from config import (
     RECENT_CERT_DAYS,
     SOURCE_TIMEOUT,
 )
+from utils.console import safe_print as print
 from utils.http import fetch_public
 from utils.normalization import (
     is_custom_shop_domain,

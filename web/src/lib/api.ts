@@ -1,4 +1,4 @@
-import { getToken } from "./auth";
+import { clearSession, getToken } from "./auth";
 import type { DiscoveryRun, Lead, Project, Rejected, User } from "./types";
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
@@ -37,6 +37,13 @@ async function request<T>(
       if (typeof data?.detail === "string") detail = data.detail;
     } catch {
       /* ignore */
+    }
+    // Stale JWT after API restart left the UI frozen on an old activity log.
+    if (response.status === 401 && options.auth !== false && !path.startsWith("/auth/")) {
+      clearSession();
+      if (typeof window !== "undefined") {
+        window.location.href = "/login";
+      }
     }
     throw new ApiError(response.status, detail);
   }
