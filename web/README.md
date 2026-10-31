@@ -27,6 +27,6 @@ cd web
 npm run dev
 ```
 
-Open http://localhost:3000
+Open **http://127.0.0.1:3000** (use this host consistently — `localhost` and `127.0.0.1` are different browser origins, so login tokens do not carry across).
 
 `NEXT_PUBLIC_API_URL` defaults to `http://127.0.0.1:8000` via `.env.local`.
