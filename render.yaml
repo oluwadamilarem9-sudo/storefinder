@@ -1,14 +1,28 @@
+# Path A: Streamlit app on Render + Render Postgres (not Supabase / not Streamlit Cloud).
+# Deploy: Render Dashboard → New → Blueprint → connect this repo → Apply.
+databases:
+  - name: storefinder-db
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+    # Private network only — the web service reaches Postgres internally.
+    ipAllowList: []
+
 services:
   - type: web
-    name: storefinder-backend
+    name: storefinder
     runtime: python
     plan: free
-    buildCommand: pip install -r backend/requirements.txt
-    startCommand: uvicorn backend.app:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install -r shopify-lead-finder/requirements.txt
+    startCommand: streamlit run shopify-lead-finder/app.py --server.port $PORT --server.address 0.0.0.0
+    healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.0"
       - key: DATABASE_URL
-        value: "sqlite:///./storefinder.db"
-      - key: CORS_ALLOWED_ORIGINS
-        value: "https://storefinder.streamlit.app"
+        fromDatabase:
+          name: storefinder-db
+          property: connectionString
+      - key: STREAMLIT_SERVER_HEADLESS
+        value: "true"
+      - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+        value: "false"
