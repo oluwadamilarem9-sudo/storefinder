@@ -1,20 +1,22 @@
-# Path A: Streamlit app on Render + Render Postgres (not Supabase / not Streamlit Cloud).
-# Deploy: Render Dashboard → New → Blueprint → connect this repo → Apply.
+# StoreFinder SaaS on Render: Next.js + FastAPI + dedicated discovery worker + Postgres.
+# Do not Apply this Blueprint over a live Streamlit/Supabase environment.
+# Deploy only when you intentionally cut over (see DEPLOY_RENDER.md). Deploy is operator-driven.
 databases:
   - name: storefinder-db
     plan: basic-256mb
     postgresMajorVersion: "16"
-    # Private network only — the web service reaches Postgres internally.
+    # Private network only — API and worker reach Postgres internally.
     ipAllowList: []
 
 services:
+  # HTTP API. Does not run discovery workers (START_DISCOVERY_WORKERS=0).
   - type: web
-    name: storefinder
+    name: storefinder-api
     runtime: python
-    plan: free
-    buildCommand: pip install -r shopify-lead-finder/requirements.txt
-    startCommand: streamlit run shopify-lead-finder/app.py --server.port $PORT --server.address 0.0.0.0
-    healthCheckPath: /
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn backend.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.0"
@@ -22,7 +24,50 @@ services:
         fromDatabase:
           name: storefinder-db
           property: connectionString
-      - key: STREAMLIT_SERVER_HEADLESS
-        value: "true"
-      - key: STREAMLIT_BROWSER_GATHER_USAGE_STATS
-        value: "false"
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: START_DISCOVERY_WORKERS
+        value: "0"
+      - key: WEB_ORIGIN_HOST
+        fromService:
+          name: storefinder-web
+          type: web
+          property: host
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+  # Always-on discovery queue consumer (existing shopify-lead-finder/worker.py).
+  - type: worker
+    name: storefinder-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python shopify-lead-finder/worker.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: storefinder-db
+          property: connectionString
+      - key: WORKER_SLOTS
+        value: "2"
+
+  # Next.js SaaS UI.
+  - type: web
+    name: storefinder-web
+    runtime: node
+    plan: starter
+    rootDir: web
+    buildCommand: npm ci && NEXT_PUBLIC_API_URL="https://$API_SERVICE_HOST" npm run build
+    startCommand: npx next start --hostname 0.0.0.0 --port $PORT
+    envVars:
+      - key: NODE_VERSION
+        value: "20.18.0"
+      - key: API_SERVICE_HOST
+        fromService:
+          name: storefinder-api
+          type: web
+          property: host
+      - key: NEXT_PUBLIC_API_URL
+        sync: false

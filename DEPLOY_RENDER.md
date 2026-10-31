@@ -1,45 +1,73 @@
-# Deploy StoreFinder on Render (Path A)
+# Deploy StoreFinder on Render (Next.js + FastAPI + worker)
 
-Host the Streamlit app on **Render** with **Render Postgres**.  
-You get a URL like `https://storefinder.onrender.com` — not `*.streamlit.app`.  
-No Supabase and no Streamlit Community Cloud for this path.
-
-## What the Blueprint creates
-
-`render.yaml` defines:
+Target production stack:
 
 | Resource | Name | Role |
 |---|---|---|
-| Web service | `storefinder` | Runs `streamlit run shopify-lead-finder/app.py` |
-| Postgres | `storefinder-db` | Account DB (`DATABASE_URL` wired automatically) |
+| Postgres | `storefinder-db` | Shared account DB (`DATABASE_URL`) |
+| Web | `storefinder-api` | FastAPI (`backend.app:app`). **No** embedded discovery workers |
+| Worker | `storefinder-worker` | Always-on `shopify-lead-finder/worker.py` (claims queued runs) |
+| Web | `storefinder-web` | Next.js UI (`web/`) |
 
-`DATABASE_URL` is injected by Render. Do not paste Supabase URLs into this service.
+Blueprint: repo-root [`render.yaml`](render.yaml).
 
-## Deploy steps
+This replaces the older Streamlit-only Path A Blueprint. **Do not Apply this file over a live Streamlit or Supabase production service.** Leave those alone until a deliberate cutover. Create a **new** Render Blueprint / environment when you are ready to deploy.
 
-1. Push this repo to GitHub (`main`).
-2. Open [https://dashboard.render.com](https://dashboard.render.com) and sign in (GitHub is fine).
-3. **New** → **Blueprint**.
-4. Select the `storefinder` repository and branch `main`.
-5. Confirm it detects `render.yaml`, then **Apply**.
-6. Wait until Postgres is ready and the web service finishes its first deploy.
-7. Open the service URL Render shows (ends with `.onrender.com`).
-8. Sign up a **new test user**, create a project, confirm the app works.
+## Environment variables
 
-## After it works
+### `storefinder-api`
 
-- Share the Render URL with users.
-- Then turn off / delete the old Streamlit Community Cloud app.
-- Leave Supabase alone until you no longer need any data there (optional dump/restore is a separate task).
+| Variable | Source | Notes |
+|---|---|---|
+| `DATABASE_URL` | From `storefinder-db` | Same DB as the worker |
+| `JWT_SECRET_KEY` | Render `generateValue` | Required; API refuses the local dev fallback on Render |
+| `START_DISCOVERY_WORKERS` | `0` | Prevents duplicate claimers alongside the worker service |
+| `WEB_ORIGIN_HOST` | From `storefinder-web` host | Used for CORS if `CORS_ALLOWED_ORIGINS` is empty |
+| `CORS_ALLOWED_ORIGINS` | Manual (`sync: false`) | Set to `https://<storefinder-web>.onrender.com` after first deploy (recommended) |
+
+### `storefinder-worker`
+
+| Variable | Source | Notes |
+|---|---|---|
+| `DATABASE_URL` | From `storefinder-db` | **Must match** the API |
+| `WORKER_SLOTS` | `2` | Threads inside one worker process |
+
+### `storefinder-web`
+
+| Variable | Source | Notes |
+|---|---|---|
+| `API_SERVICE_HOST` | From `storefinder-api` host | Used at build time |
+| `NEXT_PUBLIC_API_URL` | Manual (`sync: false`) or build | Build injects `https://$API_SERVICE_HOST`; set the same URL in the dashboard so rebuilds stay correct |
+
+Do **not** point these services at Supabase. Do **not** paste production credentials into the repo.
+
+## Deploy steps (when you choose to deploy)
+
+1. Push `main` only when you intend to deploy (operator decision).
+2. Render Dashboard → **New** → **Blueprint** → select this repo → confirm `render.yaml` → **Apply** into a **new** environment.
+3. Wait for Postgres, then API, worker, and web.
+4. In `storefinder-api`, set `CORS_ALLOWED_ORIGINS` to the Next.js HTTPS origin.
+5. In `storefinder-web`, confirm `NEXT_PUBLIC_API_URL` is the API HTTPS origin; rebuild web if needed.
+6. Open the web URL → sign up a **new test user** → queue a short discovery run → confirm the worker claims it and leads appear.
+
+## Local development (unchanged intent)
+
+- API with SQLite + embedded workers (default when not on Render): see [`web/README.md`](web/README.md).
+- Or set `START_DISCOVERY_WORKERS=0` and run `python shopify-lead-finder/worker.py` separately.
+- Production Render always uses the dedicated worker.
+
+## Data migration
+
+See [`docs/PRODUCTION_DATA_MIGRATION.md`](docs/PRODUCTION_DATA_MIGRATION.md). **Do not migrate until that checklist is executed and signed off.**
+
+## Rollback (deploy-level)
+
+- Keep Streamlit/Supabase untouched until cutover verification passes.
+- If the new stack fails, leave traffic on the old app; do not delete old services or databases as part of first deploy.
+- Render service rollback / redeploy previous commit if the new Blueprint environment misbehaves.
 
 ## Notes
 
-- Free web services can sleep when idle (first load after idle may be slow).
-- `storefinder-db` uses the `basic-256mb` plan (paid). Change the plan in `render.yaml` or the dashboard if you need a different size.
-- Keep `DISCOVERY_DURABLE_STORE` unset so durable writes stay on the default `sqlite` path until Phase C is approved.
-- Local `storefinder_test` is only for your PC — it is not this Render database.
-
-## Optional FastAPI backend
-
-The separate FastAPI app under `backend/` is **not** part of this Blueprint.  
-Account storage for Path A goes through Streamlit → `account_db.py` → Render Postgres.
+- API and worker use **starter** plans so discovery does not depend on a sleeping free web dyno.
+- Keep `DISCOVERY_DURABLE_STORE` unset unless Phase C durable Postgres writes are approved.
+- Local `project_data/` SQLite trees are per-process scratch; account truth is `DATABASE_URL`.

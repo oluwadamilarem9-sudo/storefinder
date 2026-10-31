@@ -198,3 +198,39 @@ def test_jwt_for_missing_user_rejected(tmp_path):
     token = create_auth_token(user_id="missing-user-id", email="x@y.z")
     response = client.get("/projects", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 401
+
+
+def test_health_ok(tmp_path):
+    client = _client(tmp_path)
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+
+def test_embedded_workers_off_when_flag_zero(tmp_path, monkeypatch):
+    from backend.app import _should_start_discovery_workers
+
+    monkeypatch.setenv("START_DISCOVERY_WORKERS", "0")
+    monkeypatch.delenv("RENDER", raising=False)
+    assert _should_start_discovery_workers(None, None) is False
+    assert _should_start_discovery_workers(None, True) is True
+
+
+def test_embedded_workers_default_off_on_render(tmp_path, monkeypatch):
+    from backend.app import _should_start_discovery_workers
+
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.delenv("START_DISCOVERY_WORKERS", raising=False)
+    assert _should_start_discovery_workers(None, None) is False
+
+
+def test_production_refuses_dev_jwt_secret(tmp_path, monkeypatch):
+    import backend.app as backend_app
+
+    monkeypatch.setenv("RENDER", "true")
+    monkeypatch.setattr(backend_app, "JWT_SECRET", backend_app._DEV_JWT_FALLBACK)
+    try:
+        backend_app.create_app(db_path=str(tmp_path / "prod-jwt.db"))
+        raise AssertionError("expected RuntimeError for weak JWT on Render")
+    except RuntimeError as exc:
+        assert "JWT_SECRET_KEY" in str(exc)

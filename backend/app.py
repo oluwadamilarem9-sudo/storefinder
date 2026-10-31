@@ -21,7 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
 
-JWT_SECRET = os.getenv("JWT_SECRET_KEY") or os.getenv("AUTH_SECRET") or "dev-secret-change-me-please-set-production-secret"
+_DEV_JWT_FALLBACK = "dev-secret-change-me-please-set-production-secret"
+JWT_SECRET = os.getenv("JWT_SECRET_KEY") or os.getenv("AUTH_SECRET") or _DEV_JWT_FALLBACK
 JWT_ALGORITHM = "HS256"
 JWT_TTL_MINUTES = 60 * 24
 
@@ -30,6 +31,36 @@ security = HTTPBearer()
 _LEAD_FINDER_ROOT = Path(__file__).resolve().parents[1] / "shopify-lead-finder"
 if str(_LEAD_FINDER_ROOT) not in sys.path:
     sys.path.insert(0, str(_LEAD_FINDER_ROOT))
+
+
+def _running_on_render() -> bool:
+    return (os.getenv("RENDER") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _require_production_secrets() -> None:
+    """Refuse insecure defaults when Render (or explicit production) hosts the API."""
+    if not (_running_on_render() or (os.getenv("STOREFINDER_ENV") or "").strip().lower() == "production"):
+        return
+    if JWT_SECRET == _DEV_JWT_FALLBACK or len(JWT_SECRET) < 24:
+        raise RuntimeError(
+            "JWT_SECRET_KEY must be set to a strong secret in production (Render generateValue)."
+        )
+
+
+def _cors_origins() -> list[str]:
+    allowed_origins_env = os.getenv("CORS_ALLOWED_ORIGINS")
+    if allowed_origins_env:
+        return [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+    # Blueprint can inject the Next.js hostname without a scheme.
+    web_host = (os.getenv("WEB_ORIGIN_HOST") or "").strip().lstrip("https://").lstrip("http://").strip("/")
+    if web_host:
+        return [f"https://{web_host}"]
+    return [
+        "http://127.0.0.1:8501",
+        "http://localhost:8501",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ]
 
 
 class SignupRequest(BaseModel):
@@ -124,24 +155,26 @@ def _service_call(path: str, method: str, payload: dict | None, token: str | Non
 
 
 def _should_start_discovery_workers(db_path: str | None, start_workers: bool | None) -> bool:
-    """Queued Next.js runs need claim_next_run workers; tests with temp DBs do not."""
+    """Local Next.js can embed workers; production Render uses a dedicated worker.py service."""
     if start_workers is not None:
         return start_workers
     if db_path is not None:
         return False
-    flag = (os.getenv("START_DISCOVERY_WORKERS") or "1").strip().lower()
+    # Prefer an explicit flag. On Render, default off so API + background worker do not double-claim.
+    default = "0" if _running_on_render() else "1"
+    flag = (os.getenv("START_DISCOVERY_WORKERS") or default).strip().lower()
     return flag not in {"0", "false", "no", "off"}
 
 
 def create_app(db_path: str | None = None, *, start_workers: bool | None = None) -> FastAPI:
+    _require_production_secrets()
     _bind_account_database(db_path)
     enable_workers = _should_start_discovery_workers(db_path, start_workers)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         if enable_workers:
-            # Keep the existing discovery_worker / pipeline path; just start it here
-            # so queued SaaS runs are claimed without a separate worker.py process.
+            # Local/dev convenience only. Production claims runs via worker.py on Render.
             os.environ.setdefault("WORKER_SLOTS", "2")
             from discovery_worker import start_worker_pool
 
@@ -149,20 +182,14 @@ def create_app(db_path: str | None = None, *, start_workers: bool | None = None)
         yield
 
     app = FastAPI(title="StoreFinder Backend", lifespan=lifespan)
-    allowed_origins_env = os.getenv("CORS_ALLOWED_ORIGINS")
-    if allowed_origins_env:
-        origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
-    else:
-        origins = [
-            "http://127.0.0.1:8501",
-            "http://localhost:8501",
-            "http://127.0.0.1:3000",
-            "http://localhost:3000",
-            "https://storefinder.streamlit.app",
-        ]
+
+    @app.get("/health")
+    def health():
+        return {"ok": True}
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
+        allow_origins=_cors_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

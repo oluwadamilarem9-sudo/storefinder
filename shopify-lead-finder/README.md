@@ -74,12 +74,12 @@ Your browser should open to `http://localhost:8501`. Click **Run discovery cycle
 
 **Do not deploy this app to Vercel.** Vercel hosts static sites and short serverless functions. This is a Streamlit Python app, so Vercel shows `404: NOT_FOUND`.
 
-**Recommended production host: [Render](https://render.com)** (Path A).
+**Recommended production host: [Render](https://render.com)** (Next.js + FastAPI + dedicated `worker.py` + Postgres).
 
-- Blueprint file: repo-root `render.yaml` (Streamlit web service + Render Postgres).
+- Blueprint file: repo-root `render.yaml`.
 - Full steps: [`DEPLOY_RENDER.md`](../DEPLOY_RENDER.md).
-- Public URL will look like `https://storefinder.onrender.com` (not Streamlit Cloud).
-- `DATABASE_URL` is wired from Render Postgres automatically — do not point this deploy at Supabase.
+- Data move checklist: [`docs/PRODUCTION_DATA_MIGRATION.md`](../docs/PRODUCTION_DATA_MIGRATION.md) (do not run until approved).
+- `DATABASE_URL` is shared by API and worker from Render Postgres — do not point this deploy at Supabase.
 
 **Terminal (optional):**
 
