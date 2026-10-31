@@ -275,8 +275,10 @@ def test_abandoned_domain_skips_late_writes(tmp_path, monkeypatch):
     thread = Thread(target=run, daemon=True)
     thread.start()
     assert started.wait(2)
-    # Let the site timeout path mark abandoned, then release the slow worker.
-    time.sleep(1.5)
+    # SITE_CHECK_TIMEOUT is 1s; wait() polls in 1s slices. Sleep past two poll
+    # cycles so the timeout path reliably marks abandoned before the gate opens
+    # (1.5s was flaky under load when the worker finished before abandon).
+    time.sleep(2.5)
     gate.set()
     thread.join(8)
     assert thread.is_alive() is False

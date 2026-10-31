@@ -433,6 +433,24 @@ def _route(session, path: str, method: str, payload: dict, token: str):
         session.commit()
         return {"id": project.id, "name": project.name}
     run_match = re.fullmatch(r"/projects/([^/]+)/runs", path)
+    if run_match and method == "GET":
+        user = _require_user(session, token)
+        project = _owned_project(session, user.id, run_match.group(1))
+        rows = (
+            session.query(DiscoveryRun)
+            .filter(DiscoveryRun.project_id == project.id, DiscoveryRun.user_id == user.id)
+            .order_by(DiscoveryRun.created_at.desc())
+            .all()
+        )
+        return [
+            {
+                "id": row.id,
+                "name": row.name,
+                "status": row.status,
+                "max_domains": row.max_domains,
+            }
+            for row in rows
+        ]
     if run_match and method == "POST":
         user = _require_user(session, token)
         project = _owned_project(session, user.id, run_match.group(1))
